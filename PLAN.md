@@ -38,37 +38,44 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 
 ---
 
-## M2 — Find the tab overlay class
+## M2 — Find the tab overlay class — **Done (2026-04-20).**
 
-**Goal:** From inside the agent, locate Lunar's obfuscated version of `GuiPlayerTabOverlay`.
+**Expected:** structural matching against obfuscated class. **Actual:** Lunar preserves MCP names for MC classes *and* methods — target is `net.minecraft.client.gui.GuiPlayerTabOverlay#renderPlayerlist(I;Lnet/minecraft/scoreboard/Scoreboard;Lnet/minecraft/scoreboard/ScoreObjective;)V`, hookable by name.
 
-**Deliverable:**
-- On agent start, register a `ClassFileTransformer` that inspects every class as it loads
-- Match a class as "tab overlay" by signature: extends `Gui` (or its obfuscated parent), contains a method that takes `(int, Scoreboard, ScoreObjective)` or equivalent bytecode shape, and references `NetworkPlayerInfo`
-- Log the matched class's obfuscated name to `agent.log` when found
-- Cache the match so we only log once
-
-**Success check:** `agent.log` contains a line like `Aurex: matched tab overlay class = net.minecraft.client.gui.aXk` (obfuscated name will vary).
-
-**Known risks:**
-- Lunar may obfuscate parent classes too — we may need to match on a chain of signatures, not just one.
-- Some classes are loaded before our transformer registers. We'll use `Instrumentation.getAllLoadedClasses()` + `retransformClasses` for classes already loaded.
+**Verified via:** a one-off `ClassFileTransformer` that parsed GuiPlayerTabOverlay's bytecode with ASM on load and logged its method table to `agent.log`. Every vanilla method (`getPlayerName`, `renderPlayerlist`, `drawPing`, etc.) is intact. Lunar has its own Mixin handlers on the class (`handler$zib000$lunar$...`, `redirect$...`), but those don't block our hook — they coexist.
 
 ---
 
-## M3 — Hook render, log on each tab render
+## M3 — Hook render, log on each tab render — **Done (2026-04-20).**
 
-**Goal:** Inject a callback into the tab render method. Prove we can run arbitrary code on every tab frame.
+**What shipped:** ASM transformer injects `INVOKESTATIC Agent.onTabRender()V` at HEAD of `GuiPlayerTabOverlay#renderPlayerlist`. `onTabRender` logs `tab rendered` throttled to 1/sec.
+
+**Classloader battle (cost most of the milestone):** Lunar's MC classloader ("IchorPipeline") refuses to delegate to bootstrap for non-Lunar/MC packages, so `appendToBootstrapClassLoaderSearch` alone leaves our patched INVOKESTATIC unresolvable. Fix is three-layered:
+1. Publish agent jar to bootstrap (so `Class.forName("com.aurex.agent.Agent", true, null)` works)
+2. Re-enter `start()` via bootstrap-loaded Agent (keeps ASM + transformer on one consistent loader — fixes the loader-constraint violation on `ClassReader.accept`)
+3. In the transformer, reflectively `ClassLoader.defineClass` Agent *directly* into Lunar's MC loader before patching, so the injected INVOKESTATIC finds the class without ever consulting IchorPipeline's filter. Requires `java.lang` opened via `Instrumentation.redefineModule` (Java 9+, called reflectively since we compile to Java 8).
+
+**Verified:** `tab rendered` lines in `agent.log` ticking at 1/sec while tab held. All gotchas captured in `memory/project_lunar_internals.md`.
+
+---
+
+## M3.5 — Arm/disarm via chat command + gate all behavior behind it
+
+**Why this exists:** once we move past log-only hooks, anything we do inside `renderPlayerlist` affects what the user sees *and* can cause side effects we don't want on servers like Hypixel — where the tab is used for lobby NPCs, game-start player lists (names obfuscated until round start), etc. We need a hard off switch before we ever modify a pixel or call the Hypixel API.
+
+**Goal:** `AX-on` / `AX-off` typed in chat toggles a global `enabled` flag. The chat message is swallowed client-side (never sent to the server). Every M4+ side effect checks `Agent.enabled` first and no-ops when false.
 
 **Deliverable:**
-- ASM transformer that, on the matched tab overlay class, finds the render method and inserts a call to `Aurex.onTabRender(...)` at method entry
-- `Aurex.onTabRender` logs once per second (throttled) to confirm it's being hit
+- `static volatile boolean enabled` on `Agent`, defaults to `false`
+- Second ASM transformer on `EntityPlayerSP#sendChatMessage(Ljava/lang/String;)V`: at method HEAD, call `Agent.onOutgoingChat(String)` — if that returns `true`, swallow the packet via an injected `RETURN`; otherwise fall through to vanilla send
+- `Agent.onOutgoingChat(String)` recognizes `AX-on` / `AX-off` / `AX-status`, flips the flag, writes a client-side chat line confirming the state (via `Minecraft.thePlayer.addChatMessage(...)` if reachable — otherwise fall back to `agent.log`), and returns `true` to swallow
+- `Agent.onTabRender()` from M3 stays as-is (it's just logging, no API calls) — the gate matters from M4 onward
 
-**Success check:** While Lunar's tab is open, `agent.log` shows regular `tab rendered` lines; when closed, they stop (or slow).
+**Success check:** Type `AX-on` in chat → see client-side `[AX] armed` confirmation, message does not appear in server chat. Type `AX-off` → see `[AX] disarmed`. Server sees neither.
 
 **Known risks:**
-- The render method may be called every frame even with tab closed (just rendering nothing). Throttle in code.
-- Bytecode verification errors if we inject incorrectly — these crash the class load. Start with the simplest possible `INVOKESTATIC` injection.
+- `EntityPlayerSP.sendChatMessage` might be inlined or routed differently in Lunar — recon may be needed before writing the transformer
+- Injecting an early `RETURN` is more delicate than a HEAD `INVOKESTATIC`; we have to be careful about any parameters still on the stack
 
 ---
 

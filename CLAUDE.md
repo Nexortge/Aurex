@@ -16,7 +16,7 @@ A Seraph-style stat overlay **injected into Lunar Client** (Minecraft 1.8.9) tha
 - **Language:** Java 8 (required — 1.8.9 runs on JVM 8; newer bytecode will not load)
 - **Build:** Gradle (wrapper checked in)
 - **Bytecode library:** ASM (org.ow2.asm) — for reading and rewriting class files at load time
-- **Injection:** Java Attach API (`com.sun.tools.attach.VirtualMachine`) — ships with JDK `tools.jar`
+- **Injection:** `-javaagent:<path>` in Lunar launcher JVM Arguments → `premain` runs before `Genesis.main`. Runtime attach is blocked by `-XX:+DisableAttachMechanism`. The `loader/` subproject still exists for the attach path if Lunar ever drops that flag, but it is not the working path today.
 - **HTTP:** `java.net.HttpURLConnection` (no external HTTP lib needed; keeps agent jar small)
 - **JSON:** Gson (single dep, small)
 - **Target runtime:** Lunar Client 1.8.9 on Windows
@@ -47,17 +47,25 @@ ownSeraph/                     ← physical folder (legacy name)
 
 `loader` and `agent` are separate Gradle subprojects because they run in different JVMs (loader attaches FROM outside; agent runs INSIDE Lunar).
 
-## Build & run (once M0 lands)
+## Build & run
 
 ```
-# Build both jars
-./gradlew build
+# Build agent jar (loader still builds but is unused)
+./gradlew :agent:build
 
-# Start Lunar manually, then attach
-java -jar loader/build/libs/aurex-loader.jar
+# Output:
+#   agent/build/libs/aurex-agent.jar
 ```
 
-The loader finds Lunar's PID via `jps`/`VirtualMachine.list()`, then calls `vm.loadAgent("path/to/aurex-agent.jar")`. The agent's `agentmain` runs inside Lunar's JVM with full `Instrumentation` access.
+**Install into Lunar (one-time):** Lunar launcher → Settings → Java Integration → JVM Arguments, add:
+
+```
+-javaagent:C:\Users\nexor\Documents\ownSeraph\agent\build\libs\aurex-agent.jar
+```
+
+After any `./gradlew :agent:build`, just restart Lunar — the jar path doesn't change, the new bytes do.
+
+**Verify it ran:** tail `%APPDATA%\Aurex\agent.log`. Every Lunar launch appends a `hello from inside Lunar (premain)` line with a timestamp.
 
 ## Architecture principles
 
@@ -69,7 +77,8 @@ The loader finds Lunar's PID via `jps`/`VirtualMachine.list()`, then calls `vm.l
 
 ## Key constraints / gotchas
 
-- **Java Agent quirks:** `premain` runs before `main`; `agentmain` runs after (attach-time). We use `agentmain`. Manifest *must* include `Agent-Class`, `Can-Retransform-Classes: true`, and `Can-Redefine-Classes: true`.
+- **Java Agent quirks:** `premain` runs before `main`; `agentmain` runs after (attach-time). **We use `premain`** — Lunar blocks attach. Manifest includes `Premain-Class`, `Agent-Class`, `Can-Retransform-Classes: true`, `Can-Redefine-Classes: true`.
+- **Classloader dance is mandatory** for any INVOKESTATIC we inject into MC classes. See `memory/project_lunar_internals.md` for the three-layer fix (bootstrap append → re-enter via bootstrap-loaded Agent → reflective `defineClass` into Lunar's MC loader from within the transformer). Short version: Lunar's MC classloader ("IchorPipeline") does NOT delegate to bootstrap for our packages, so just living on bootstrap isn't enough — we also have to seed our hook class directly into whichever loader loaded the target MC class.
 - **ASM version:** Use ASM 9.x (supports Java 8 bytecode fine; newer API is cleaner).
 - **Lunar may block reflection** into some internals. If a standard hook fails, we fall back to ASM bytecode rewrite.
 - **Gradle version:** Must be 7.x to run on JDK 8 (Gradle 8+ requires JDK 17). We target **Gradle 7.6.4**.
