@@ -1,0 +1,25 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs & local output
+*.log
+agent.log
+
+# Local config — never commit the API key
+config.json
+local.properties

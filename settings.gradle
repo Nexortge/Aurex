@@ -1,0 +1,10 @@
+// Gradle's "settings" file — tells Gradle what the project is called and which
+// subprojects exist. Think of it like a solution (.sln) file in C#.
+rootProject.name = 'aurex'
+
+// We have two subprojects because they run in completely different JVMs:
+//   - loader: a normal CLI app you run from outside Lunar
+//   - agent:  a Java Agent that gets injected INTO Lunar's JVM
+// Keeping them separate keeps their dependencies and manifests clean.
+include 'loader'
+include 'agent'

@@ -1,0 +1,25 @@
+// Root build script — applies shared config to every subproject.
+// In C# terms, this is like <Directory.Build.props> for a solution.
+
+// `allprojects` = apply to root + every subproject.
+// `subprojects` = apply to every subproject but NOT root. We use subprojects
+// because the root project itself produces no code.
+subprojects {
+    apply plugin: 'java'
+
+    // Minecraft 1.8.9 runs on a Java 8 JVM. If we compile to newer bytecode
+    // (say Java 11), Lunar's JVM will throw UnsupportedClassVersionError at
+    // load time. So everything we produce MUST be Java 8 bytecode.
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+
+    // UTF-8 source encoding everywhere. Windows' default (Cp1252) causes
+    // silent bugs with non-ASCII characters like Bedwars' star symbol ⭐.
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+    }
+
+    repositories {
+        mavenCentral()
+    }
+}

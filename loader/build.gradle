@@ -1,0 +1,29 @@
+// Loader = the small CLI program you run from OUTSIDE Lunar.
+// Its one job: find Lunar's JVM and attach the agent jar to it.
+
+dependencies {
+    // tools.jar ships with JDK 8 and contains the Attach API
+    // (com.sun.tools.attach.VirtualMachine). It's not on the default
+    // classpath — we have to name it explicitly.
+    //
+    // `compileOnly` = needed to compile, NOT bundled into our jar. At
+    // runtime, the loader will locate tools.jar from the running JDK's
+    // java.home and add it to the classloader dynamically. This way we
+    // don't have to ship Oracle's tools.jar ourselves.
+    compileOnly files("${System.properties['java.home']}/../lib/tools.jar")
+}
+
+jar {
+    archiveBaseName = 'aurex-loader'
+
+    manifest {
+        attributes(
+            // Main-Class makes `java -jar aurex-loader.jar` work, and
+            // also makes the jar clickable on Windows (if .jar is associated
+            // with javaw.exe).
+            'Main-Class': 'com.aurex.loader.Main',
+            'Implementation-Title': 'Aurex Loader',
+            'Implementation-Version': project.version ?: '0.0.1'
+        )
+    }
+}

@@ -1,0 +1,62 @@
+// Agent = the jar that gets injected INTO Lunar's JVM at runtime.
+// It runs with full Instrumentation access — it can see and rewrite
+// every class Lunar loads.
+
+dependencies {
+    // ASM — reads and rewrites Java bytecode. We'll use it heavily from
+    // M2 onward to find and transform Lunar's obfuscated classes.
+    // Adding it now so the dep is wired; not used in M0.
+    implementation 'org.ow2.asm:asm:9.6'
+    implementation 'org.ow2.asm:asm-tree:9.6'
+    implementation 'org.ow2.asm:asm-util:9.6'
+
+    // Gson — JSON parsing for Hypixel API responses. Used from M5.
+    implementation 'com.google.code.gson:gson:2.10.1'
+}
+
+jar {
+    archiveBaseName = 'aurex-agent'
+
+    // A Java Agent's manifest has special attributes the JVM looks for
+    // when vm.loadAgent(...) is called. Getting these wrong = silent
+    // failure or AttachNotSupportedException.
+    manifest {
+        attributes(
+            // Entry point when the agent is attached at runtime (AFTER
+            // the JVM is already running). This is our case — the loader
+            // attaches to an already-running Lunar.
+            'Agent-Class': 'com.aurex.agent.Agent',
+
+            // Entry point when the agent is loaded via -javaagent (BEFORE
+            // main() runs). Lunar won't use this path, but we set it so
+            // the jar is also usable as a -javaagent for testing.
+            'Premain-Class': 'com.aurex.agent.Agent',
+
+            // We want to modify classes as they load AND retroactively
+            // modify classes that were already loaded before we attached.
+            // Both flags must be true; defaults are false.
+            'Can-Retransform-Classes': 'true',
+            'Can-Redefine-Classes': 'true',
+
+            'Implementation-Title': 'Aurex Agent',
+            'Implementation-Version': project.version ?: '0.0.1'
+        )
+    }
+
+    // Fat jar: bundle all our dependencies (ASM, Gson) INTO the agent
+    // jar. Agents can't rely on the host JVM having these libs, so we
+    // ship them ourselves.
+    //
+    // `from { configurations.runtimeClasspath.collect { ... } }` pulls
+    // every runtime-classpath entry, unzips jars, and merges them into
+    // our output jar. Duplicates (like META-INF signatures from signed
+    // deps) are excluded to avoid jar verification errors.
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    exclude 'META-INF/*.SF'
+    exclude 'META-INF/*.DSA'
+    exclude 'META-INF/*.RSA'
+
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
