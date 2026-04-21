@@ -59,23 +59,19 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 
 ---
 
-## M3.5 — Arm/disarm via chat command + gate all behavior behind it
+## M3.5 — Arm/disarm via chat command + gate all behavior behind it — **Done (2026-04-21).**
 
-**Why this exists:** once we move past log-only hooks, anything we do inside `renderPlayerlist` affects what the user sees *and* can cause side effects we don't want on servers like Hypixel — where the tab is used for lobby NPCs, game-start player lists (names obfuscated until round start), etc. We need a hard off switch before we ever modify a pixel or call the Hypixel API.
+**What shipped:**
+- `ChatCommandTransformer` hooks `EntityPlayerSP#sendChatMessage(String)` at HEAD. Injected prefix calls `Agent.onOutgoingChat(String)`; if it returns `true`, an injected `RETURN` swallows the packet client-side.
+- `Agent.onOutgoingChat` recognizes `AX-on` / `AX-off` / `AX-status` (case-insensitive). `AX-on` flips `Agent.enabled` to true **and auto-disarms after 3s** — UX choice so we can't forget the arm on. A second AX-on bumps `disarmAt`, and the stale scheduled task no-ops when it fires (generation-token pattern). AX-off cancels immediately.
+- Chat confirmation via reflective `Minecraft.thePlayer.addChatMessage(new ChatComponentText(...))` — green for armed, red for disarmed/auto-disarmed, yellow for status.
+- `DisarmTask` is a top-level class (not a lambda/inner class) so `AgentPublisher` can publish it alongside `Agent` into Lunar's MC classloader. Anonymous inner classes would be invisible to MC loader.
+- `AgentPublisher` extracted from `TabOverlayTransformer` — now shared between both transformers with a single `published` flag.
+- Log truncates on every JVM launch (requested UX — was piling up across crashes).
 
-**Goal:** `AX-on` / `AX-off` typed in chat toggles a global `enabled` flag. The chat message is swallowed client-side (never sent to the server). Every M4+ side effect checks `Agent.enabled` first and no-ops when false.
+**Classloader gotcha #2 (on top of the M3 three-layer fix):** Java 7+ bytecode requires a stackmap frame at every branch target. `ClassWriter.COMPUTE_MAXS` does NOT compute frames; injecting an `IFEQ` without a `FrameNode` at its target throws `VerifyError: Expecting a stackmap frame at branch target N` on class load. Fix is a single `FrameNode(F_SAME, 0, null, 0, null)` after the continue label — stack is empty, locals unchanged. Saved to `memory/project_asm_branch_target_frames.md`.
 
-**Deliverable:**
-- `static volatile boolean enabled` on `Agent`, defaults to `false`
-- Second ASM transformer on `EntityPlayerSP#sendChatMessage(Ljava/lang/String;)V`: at method HEAD, call `Agent.onOutgoingChat(String)` — if that returns `true`, swallow the packet via an injected `RETURN`; otherwise fall through to vanilla send
-- `Agent.onOutgoingChat(String)` recognizes `AX-on` / `AX-off` / `AX-status`, flips the flag, writes a client-side chat line confirming the state (via `Minecraft.thePlayer.addChatMessage(...)` if reachable — otherwise fall back to `agent.log`), and returns `true` to swallow
-- `Agent.onTabRender()` from M3 stays as-is (it's just logging, no API calls) — the gate matters from M4 onward
-
-**Success check:** Type `AX-on` in chat → see client-side `[AX] armed` confirmation, message does not appear in server chat. Type `AX-off` → see `[AX] disarmed`. Server sees neither.
-
-**Known risks:**
-- `EntityPlayerSP.sendChatMessage` might be inlined or routed differently in Lunar — recon may be needed before writing the transformer
-- Injecting an early `RETURN` is more delicate than a HEAD `INVOKESTATIC`; we have to be careful about any parameters still on the stack
+**Verified 2026-04-21:** AX-on → green `[AX] armed (3s)` in chat, message not sent to server; 3s later → red `[AX] auto-disarmed`; AX-on then AX-off → red `[AX] disarmed` immediately; AX-status → yellow state readout. Tab render hook from M3 still works alongside the new chat hook. Works in singleplayer too (no server required).
 
 ---
 

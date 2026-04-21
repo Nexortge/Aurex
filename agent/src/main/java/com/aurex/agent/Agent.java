@@ -5,6 +5,7 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.lang.instrument.Instrumentation;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -13,6 +14,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.Timer;
 import java.util.jar.JarFile;
 
 /**
@@ -61,6 +63,7 @@ public final class Agent {
      *    (transformer, ASM, Agent itself) on a single consistent classloader.
      */
     public static void premain(String args, Instrumentation inst) {
+        truncateLog();
         log("hello from inside Lunar (premain)");
         try {
             File self = new File(Agent.class.getProtectionDomain()
@@ -90,6 +93,7 @@ public final class Agent {
         log("Agent.start (bootstrap classloader)");
         openJavaLangForReflection(inst);
         inst.addTransformer(new TabOverlayTransformer());
+        inst.addTransformer(new ChatCommandTransformer());
     }
 
     /**
@@ -159,6 +163,130 @@ public final class Agent {
         }
     }
 
+    // ---- M3.5: arm/disarm gate ------------------------------------------------
+
+    /**
+     * Master enable flag for every M4+ feature that modifies rendering or hits
+     * the network. Defaults to false — armed only via chat command, auto-disarms
+     * after 3s so we can't forget it on.
+     *
+     * Package-private volatile so {@link DisarmTask} can both read and write it
+     * from the Timer thread. Read from render-thread code via {@link #isEnabled()}.
+     */
+    static volatile boolean enabled;
+
+    /**
+     * Epoch millis at which the currently-scheduled auto-disarm will fire.
+     * Used as a "generation token": {@link DisarmTask} captures this value at
+     * schedule time and no-ops if it doesn't match when the timer fires. That
+     * way a second AX-on simply bumps {@code disarmAt}, scheduling a new task,
+     * and the stale task sees the mismatch and returns.
+     */
+    static volatile long disarmAt;
+
+    /** Single background Timer for all scheduled tasks. Daemon = doesn't block JVM shutdown. */
+    private static final Timer timer = new Timer("Aurex-Timer", true);
+
+    /** How long AX-on keeps the gate open before auto-disarming. */
+    private static final long ARM_MS = 3000L;
+
+    /**
+     * Called from the HEAD of {@code EntityPlayerSP#sendChatMessage(String)}.
+     * Return {@code true} to swallow the outgoing packet (our commands), {@code
+     * false} to let it go to the server (normal chat).
+     *
+     * Must never throw — an exception here propagates out of the client's chat
+     * send path. On error we return false so chat still works.
+     */
+    public static boolean onOutgoingChat(String message) {
+        try {
+            if (message == null) return false;
+            String trimmed = message.trim();
+
+            if (trimmed.equalsIgnoreCase("AX-on")) {
+                arm();
+                return true;
+            }
+            if (trimmed.equalsIgnoreCase("AX-off")) {
+                disarm(true);
+                return true;
+            }
+            if (trimmed.equalsIgnoreCase("AX-status")) {
+                sendClientChat("\u00a7e[AX] " + (enabled ? "armed" : "disarmed"));
+                return true;
+            }
+            return false;
+        } catch (Throwable t) {
+            log("onOutgoingChat failed: " + t);
+            return false;
+        }
+    }
+
+    private static void arm() {
+        long fireAt = System.currentTimeMillis() + ARM_MS;
+        disarmAt = fireAt;
+        enabled = true;
+        log("AX-on (armed for " + ARM_MS + "ms)");
+        sendClientChat("\u00a7a[AX] armed (3s)");
+        // Timer.schedule(task, delay) — task.run() fires on the Timer's thread
+        // after delay ms. DisarmTask checks disarmAt == fireAt before actually
+        // disarming, so a later arm() simply invalidates this task.
+        timer.schedule(new DisarmTask(fireAt), ARM_MS);
+    }
+
+    private static void disarm(boolean announce) {
+        enabled = false;
+        disarmAt = 0L;
+        log("AX-off (disarmed manually)");
+        if (announce) sendClientChat("\u00a7c[AX] disarmed");
+    }
+
+    /**
+     * Call from any feature gate to check if Aurex is currently armed. Centralized
+     * so we can later add "auto-disarm on lazy check" semantics if the Timer
+     * approach misbehaves.
+     */
+    public static boolean isEnabled() {
+        return enabled;
+    }
+
+    /**
+     * Print a client-side chat line (not sent to the server). Used for AX
+     * command confirmations.
+     *
+     * Reflective because this code path ends up running in three classloader
+     * copies (app / bootstrap / MC); only the MC copy can see MC classes at
+     * compile time, but reflection works from any of them since
+     * {@link Class#forName(String)} uses the caller's classloader, which for
+     * the MC copy is Lunar's MC loader — where {@code net.minecraft.*} lives.
+     *
+     * Package-private so {@link DisarmTask} can call it from the Timer thread.
+     */
+    static void sendClientChat(String text) {
+        try {
+            Class<?> mcClass = Class.forName("net.minecraft.client.Minecraft");
+            Method getMinecraft = mcClass.getMethod("getMinecraft");
+            Object mc = getMinecraft.invoke(null);
+
+            Field thePlayerField = mcClass.getField("thePlayer");
+            Object thePlayer = thePlayerField.get(mc);
+            if (thePlayer == null) {
+                log("sendClientChat: thePlayer is null, skipping: " + text);
+                return;
+            }
+
+            Class<?> componentClass = Class.forName("net.minecraft.util.ChatComponentText");
+            Object component = componentClass.getConstructor(String.class).newInstance(text);
+
+            Class<?> iChatComponent = Class.forName("net.minecraft.util.IChatComponent");
+            Class<?> entityPlayer = Class.forName("net.minecraft.entity.player.EntityPlayer");
+            Method addChatMessage = entityPlayer.getMethod("addChatMessage", iChatComponent);
+            addChatMessage.invoke(thePlayer, component);
+        } catch (Throwable t) {
+            log("sendClientChat failed: " + t);
+        }
+    }
+
     /**
      * Append a timestamped line to %APPDATA%\Aurex\agent.log.
      *
@@ -183,6 +311,23 @@ public final class Agent {
             out.println(timestamp + " " + TAG + ": " + message);
         } catch (IOException ignored) {
             // Same rationale as above — never let a log failure bubble up.
+        }
+    }
+
+    /**
+     * Truncate the log at the start of each JVM run so old launches don't
+     * pile up. Called from {@link #premain} exactly once per JVM — the
+     * bootstrap and MC-loader copies of Agent never run this, they just
+     * append. Safe if the file doesn't exist yet.
+     */
+    private static void truncateLog() {
+        File file = logFile();
+        File dir = file.getParentFile();
+        if (dir != null && !dir.exists() && !dir.mkdirs()) return;
+        try (PrintWriter out = new PrintWriter(new FileWriter(file, false))) {
+            // opening in non-append mode truncates; nothing to write.
+        } catch (IOException ignored) {
+            // Same as log(): never let a log-init failure bubble up.
         }
     }
 
