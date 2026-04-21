@@ -166,28 +166,37 @@ public final class Agent {
     // ---- M3.5: arm/disarm gate ------------------------------------------------
 
     /**
-     * Master enable flag for every M4+ feature that modifies rendering or hits
-     * the network. Defaults to false — armed only via chat command, auto-disarms
-     * after 3s so we can't forget it on.
+     * Persistent display gate. AX-on turns it on, AX-off turns it off — no
+     * auto-disarm. Any M4+ feature that mutates what the user sees (tab, HUD,
+     * chat injections) must check this before touching rendering.
      *
-     * Package-private volatile so {@link DisarmTask} can both read and write it
-     * from the Timer thread. Read from render-thread code via {@link #isEnabled()}.
+     * Separate from {@link #fetchArmed} so the 3s safety window only limits
+     * outbound API traffic; once data is in the cache, it stays visible until
+     * the user explicitly types AX-off.
      */
-    static volatile boolean enabled;
+    static volatile boolean displayEnabled;
 
     /**
-     * Epoch millis at which the currently-scheduled auto-disarm will fire.
-     * Used as a "generation token": {@link DisarmTask} captures this value at
-     * schedule time and no-ops if it doesn't match when the timer fires. That
-     * way a second AX-on simply bumps {@code disarmAt}, scheduling a new task,
-     * and the stale task sees the mismatch and returns.
+     * Fetch-window gate. AX-on flips this to true for {@link #ARM_MS}, then
+     * {@link DisarmTask} clears it. Gates outbound network calls (Hypixel API
+     * from M5 onward) so we can't accidentally spray requests by leaving the
+     * overlay on.
+     */
+    static volatile boolean fetchArmed;
+
+    /**
+     * Epoch millis at which the currently-scheduled fetch-window close will
+     * fire. Used as a "generation token": {@link DisarmTask} captures this
+     * value at schedule time and no-ops if it doesn't match when the timer
+     * fires. A second AX-on simply bumps {@code disarmAt}, scheduling a new
+     * task, and the stale task sees the mismatch and returns.
      */
     static volatile long disarmAt;
 
     /** Single background Timer for all scheduled tasks. Daemon = doesn't block JVM shutdown. */
     private static final Timer timer = new Timer("Aurex-Timer", true);
 
-    /** How long AX-on keeps the gate open before auto-disarming. */
+    /** How long AX-on keeps the fetch window open before auto-closing. */
     private static final long ARM_MS = 3000L;
 
     /**
@@ -212,7 +221,8 @@ public final class Agent {
                 return true;
             }
             if (trimmed.equalsIgnoreCase("AX-status")) {
-                sendClientChat("\u00a7e[AX] " + (enabled ? "armed" : "disarmed"));
+                sendClientChat("\u00a7e[AX] display=" + (displayEnabled ? "on" : "off")
+                        + " fetch=" + (fetchArmed ? "armed" : "idle"));
                 return true;
             }
             return false;
@@ -225,9 +235,10 @@ public final class Agent {
     private static void arm() {
         long fireAt = System.currentTimeMillis() + ARM_MS;
         disarmAt = fireAt;
-        enabled = true;
-        log("AX-on (armed for " + ARM_MS + "ms)");
-        sendClientChat("\u00a7a[AX] armed (3s)");
+        displayEnabled = true;
+        fetchArmed = true;
+        log("AX-on (display on; fetch armed for " + ARM_MS + "ms)");
+        sendClientChat("\u00a7a[AX] on (fetch 3s)");
         // Timer.schedule(task, delay) — task.run() fires on the Timer's thread
         // after delay ms. DisarmTask checks disarmAt == fireAt before actually
         // disarming, so a later arm() simply invalidates this task.
@@ -235,19 +246,49 @@ public final class Agent {
     }
 
     private static void disarm(boolean announce) {
-        enabled = false;
+        displayEnabled = false;
+        fetchArmed = false;
         disarmAt = 0L;
-        log("AX-off (disarmed manually)");
-        if (announce) sendClientChat("\u00a7c[AX] disarmed");
+        log("AX-off (display + fetch off)");
+        if (announce) sendClientChat("\u00a7c[AX] off");
     }
 
     /**
-     * Call from any feature gate to check if Aurex is currently armed. Centralized
-     * so we can later add "auto-disarm on lazy check" semantics if the Timer
-     * approach misbehaves.
+     * Gate for rendering-side features (tab mutation, HUD, etc.). Persists
+     * across the fetch window, only flips off on explicit AX-off.
      */
-    public static boolean isEnabled() {
-        return enabled;
+    public static boolean isDisplayEnabled() {
+        return displayEnabled;
+    }
+
+    /**
+     * Gate for outbound network calls. Only true during the 3s window after
+     * AX-on so a stuck overlay can't keep hitting Hypixel's API.
+     */
+    public static boolean isFetchArmed() {
+        return fetchArmed;
+    }
+
+    /**
+     * Called from {@code GuiPlayerTabOverlay.getPlayerName} before each
+     * {@code ARETURN} (M4 hook). Appends " [TEST]" to every entry as a
+     * visible proof-of-concept that we control the rendered name string.
+     *
+     * Alignment is deliberately *not* computed here — proper column layout
+     * will come in M8 when we replace vanilla tab rendering entirely rather
+     * than piggy-backing on it.
+     *
+     * Must never throw: runs on Lunar's render thread, once per tab entry,
+     * every frame. On error we return the original name so tab still renders.
+     */
+    public static String decorateName(String originalName) {
+        try {
+            if (!displayEnabled) return originalName;
+            if (originalName == null) return originalName;
+            return originalName + " [TEST]";
+        } catch (Throwable t) {
+            return originalName;
+        }
     }
 
     /**

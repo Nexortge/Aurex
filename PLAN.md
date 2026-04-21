@@ -63,28 +63,33 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 
 **What shipped:**
 - `ChatCommandTransformer` hooks `EntityPlayerSP#sendChatMessage(String)` at HEAD. Injected prefix calls `Agent.onOutgoingChat(String)`; if it returns `true`, an injected `RETURN` swallows the packet client-side.
-- `Agent.onOutgoingChat` recognizes `AX-on` / `AX-off` / `AX-status` (case-insensitive). `AX-on` flips `Agent.enabled` to true **and auto-disarms after 3s** — UX choice so we can't forget the arm on. A second AX-on bumps `disarmAt`, and the stale scheduled task no-ops when it fires (generation-token pattern). AX-off cancels immediately.
-- Chat confirmation via reflective `Minecraft.thePlayer.addChatMessage(new ChatComponentText(...))` — green for armed, red for disarmed/auto-disarmed, yellow for status.
-- `DisarmTask` is a top-level class (not a lambda/inner class) so `AgentPublisher` can publish it alongside `Agent` into Lunar's MC classloader. Anonymous inner classes would be invisible to MC loader.
+- `Agent.onOutgoingChat` recognizes `AX-on` / `AX-off` / `AX-status` (case-insensitive). Initial implementation used a single `enabled` flag with 3s auto-disarm on everything; **refactored during M4 prep into two flags:**
+  - `displayEnabled` — persistent, toggled by `AX-on`/`AX-off`, no auto-off. Gates all render-side mutations (M4+).
+  - `fetchArmed` — 3s auto-off window, cleared by `DisarmTask`. Will gate outbound API calls (M5+).
+  - `AX-on` turns both on (display persistently, fetch for 3s). `AX-off` turns both off. This way the 3s safety timer limits *only* network traffic; what the user sees stays up until they explicitly type `AX-off`.
+- Chat confirmation via reflective `Minecraft.thePlayer.addChatMessage(new ChatComponentText(...))` — green for `[AX] on (fetch 3s)`, yellow for `[AX] fetch window closed`, red for `[AX] off`, yellow for status readout `display=on/off fetch=armed/idle`.
+- `DisarmTask` is a top-level class (not a lambda/inner class) so `AgentPublisher` can publish it alongside `Agent` into Lunar's MC classloader. Anonymous inner classes would be invisible to MC loader. Task now only clears `fetchArmed`, leaving `displayEnabled` intact.
 - `AgentPublisher` extracted from `TabOverlayTransformer` — now shared between both transformers with a single `published` flag.
 - Log truncates on every JVM launch (requested UX — was piling up across crashes).
 
 **Classloader gotcha #2 (on top of the M3 three-layer fix):** Java 7+ bytecode requires a stackmap frame at every branch target. `ClassWriter.COMPUTE_MAXS` does NOT compute frames; injecting an `IFEQ` without a `FrameNode` at its target throws `VerifyError: Expecting a stackmap frame at branch target N` on class load. Fix is a single `FrameNode(F_SAME, 0, null, 0, null)` after the continue label — stack is empty, locals unchanged. Saved to `memory/project_asm_branch_target_frames.md`.
 
-**Verified 2026-04-21:** AX-on → green `[AX] armed (3s)` in chat, message not sent to server; 3s later → red `[AX] auto-disarmed`; AX-on then AX-off → red `[AX] disarmed` immediately; AX-status → yellow state readout. Tab render hook from M3 still works alongside the new chat hook. Works in singleplayer too (no server required).
+**Verified 2026-04-21:** AX-on → green `[AX] armed (3s)` in chat, message not sent to server; 3s later → red `[AX] auto-disarmed`; AX-on then AX-off → red `[AX] disarmed` immediately; AX-status → yellow state readout. Tab render hook from M3 still works alongside the new chat hook. Works in singleplayer too (no server required). Flag-split refactor verified as part of M4.
 
 ---
 
-## M4 — Modify a tab entry
+## M4 — Modify a tab entry — **Done (2026-04-21).**
 
-**Goal:** Actually change what the user sees. Replace one player's displayed name with `[TEST] PlayerName`.
+**Goal:** Actually change what the user sees. Append ` [TEST]` to every name rendered in the tab list, gated on `Agent.isDisplayEnabled()`.
 
-**Deliverable:**
-- Hook deeper into the render method (or a helper it calls) where the display name is resolved per player
-- Prepend `[TEST] ` to every entry, OR (cleaner) to just the local player's entry
-- No crashes, no visual glitches
+**What shipped:**
+- Extended `TabOverlayTransformer` to also patch `GuiPlayerTabOverlay#getPlayerName(NetworkPlayerInfo)`. Before every `ARETURN` it injects `INVOKESTATIC Agent.decorateName(String)String`, which consumes the existing String on the stack and pushes a (possibly) modified one. Stack shape at ARETURN unchanged → no stackmap frame edits needed, and no new branches introduced.
+- `Agent.decorateName(String)` returns `originalName` unchanged when `displayEnabled` is false; otherwise appends `" [TEST]"`. Never throws — render-thread safety.
+- Scoped to *every* tab entry for M4 (simpler proof-of-concept). Refining to local-player-only or per-UUID decoration is M6 work when real stats land.
 
-**Success check:** Open tab in-game, see modified names.
+**Why no column alignment yet:** briefly experimented with reflective `FontRenderer.getStringWidth` + space-padding to line up `[TEST]` as a right-aligned column. MC's default font is variable-width so accuracy was capped at ±4px. Decided to skip — pixel-perfect column layout is M8's job (replace vanilla rendering entirely with our own `FontRenderer.drawString` at computed coords), and tuning a throwaway approximation first is pure churn. Reverted to a plain ` [TEST]` suffix.
+
+**Verified 2026-04-21:** `AX-on`, opened tab in Hypixel lobby — every row ended with ` [TEST]` including Lunar-cosmetic rows. 3s later fetch window closed, names stayed decorated. `AX-off` → tab back to vanilla. Lunar's own mixin icon renders alongside unaffected (separate draw call from the name string).
 
 **This is the end of the POC phase.** Everything past here is building the actual product on top of a proven hook point.
 
