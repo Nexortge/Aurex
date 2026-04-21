@@ -8,6 +8,7 @@ import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.VarInsnNode;
 
 import java.lang.instrument.ClassFileTransformer;
 import java.security.ProtectionDomain;
@@ -49,7 +50,16 @@ final class TabOverlayTransformer implements ClassFileTransformer {
     private static final String ON_TAB_RENDER = "onTabRender";
     private static final String ON_TAB_RENDER_DESC = "()V";
     private static final String DECORATE_NAME = "decorateName";
-    private static final String DECORATE_NAME_DESC = "(Ljava/lang/String;)Ljava/lang/String;";
+    // Takes (String, Object) — the Object is actually the NetworkPlayerInfo from
+    // ALOAD 1. We declare it as Object, not NetworkPlayerInfo, because the Agent
+    // class is compiled without MC libs on the classpath (can't write
+    // "NetworkPlayerInfo" as a Java type). The verifier accepts the NPI on the
+    // stack because NPI is-a Object. Agent reflects on it to reach the UUID.
+    //
+    // Critical: the descriptor MUST match Agent.decorateName's declared signature
+    // exactly — JVM method lookup is by (name, descriptor), no covariance.
+    private static final String DECORATE_NAME_DESC =
+            "(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/String;";
 
     @Override
     public byte[] transform(ClassLoader loader,
@@ -105,11 +115,20 @@ final class TabOverlayTransformer implements ClassFileTransformer {
     }
 
     /**
-     * Before every {@code ARETURN} in {@code getPlayerName}, insert an
-     * {@code INVOKESTATIC Agent.decorateName(String)String}. The call pops the
-     * existing String off the stack and pushes a (possibly modified) String,
-     * so the stack shape at ARETURN is unchanged — no stackmap frame edits
-     * needed. No new branches introduced either.
+     * Before every {@code ARETURN} in {@code getPlayerName}, insert
+     * {@code ALOAD 1} (the NetworkPlayerInfo param — slot 0 is {@code this})
+     * then {@code INVOKESTATIC Agent.decorateName(String, NetworkPlayerInfo)String}.
+     *
+     * <p>Stack transitions:
+     * <pre>
+     *   before hook:  [..., String]
+     *   + ALOAD 1:    [..., String, NetworkPlayerInfo]
+     *   + INVOKESTATIC (pops 2, pushes 1):  [..., String]
+     *   ARETURN:      [..., String]   — unchanged from original
+     * </pre>
+     * Because the ARETURN stack shape is preserved and we introduce no new
+     * branches, no stackmap frame edits are needed ({@code COMPUTE_MAXS} is
+     * sufficient; {@code COMPUTE_FRAMES} would be overkill).
      *
      * Iterates over a snapshot (via {@code toArray()}) because
      * {@code insertBefore} mutates the list during traversal.
@@ -120,6 +139,7 @@ final class TabOverlayTransformer implements ClassFileTransformer {
         for (AbstractInsnNode insn : insns) {
             if (insn.getOpcode() == Opcodes.ARETURN) {
                 InsnList call = new InsnList();
+                call.add(new VarInsnNode(Opcodes.ALOAD, 1));
                 call.add(new MethodInsnNode(
                         Opcodes.INVOKESTATIC, HOOK_OWNER, DECORATE_NAME,
                         DECORATE_NAME_DESC, false));

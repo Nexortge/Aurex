@@ -92,8 +92,28 @@ public final class Agent {
     public static void start(Instrumentation inst) {
         log("Agent.start (bootstrap classloader)");
         openJavaLangForReflection(inst);
+        preloadImpl();
         inst.addTransformer(new TabOverlayTransformer());
         inst.addTransformer(new ChatCommandTransformer());
+    }
+
+    /**
+     * Trigger {@link AgentImpl}'s static initializer now (on bootstrap), so the
+     * API-key load + {@link com.aurex.agent.api.HypixelClient} construction happen
+     * at premain time — not on the render thread the first time a tab opens.
+     *
+     * <p>We keep AgentImpl out of this class's imports on purpose (see
+     * {@link AgentImpl}'s javadoc): Agent is {@code defineClass}'d into Lunar's
+     * MC loader, which can't see {@code com.aurex.agent.api.*}. Class.forName
+     * by name is loader-safe — the MC copy of Agent never actually links to
+     * AgentImpl's bytecode, it just reflects into the bootstrap copy at call time.
+     */
+    private static void preloadImpl() {
+        try {
+            Class.forName("com.aurex.agent.AgentImpl", true, null);
+        } catch (Throwable t) {
+            log("preloadImpl failed: " + t);
+        }
     }
 
     /**
@@ -271,23 +291,47 @@ public final class Agent {
 
     /**
      * Called from {@code GuiPlayerTabOverlay.getPlayerName} before each
-     * {@code ARETURN} (M4 hook). Appends " [TEST]" to every entry as a
-     * visible proof-of-concept that we control the rendered name string.
+     * {@code ARETURN}. Stack at call site is {@code [String, NetworkPlayerInfo]};
+     * we pop both and push a (possibly) modified String — stack shape at ARETURN
+     * is unchanged, so no stackmap edits are needed.
      *
-     * Alignment is deliberately *not* computed here — proper column layout
-     * will come in M8 when we replace vanilla tab rendering entirely rather
-     * than piggy-backing on it.
+     * <p>The real work (API-key / StatsCache / formatting) lives in
+     * {@link AgentImpl#decorateInternal}. This method only exists on the MC
+     * classloader copy of Agent, where we can't compile-time reference any
+     * {@code com.aurex.agent.api.*} class — so we reflect across to the
+     * bootstrap copy of AgentImpl once and cache the {@link Method} handle.
      *
-     * Must never throw: runs on Lunar's render thread, once per tab entry,
+     * <p>Gate order matters: we check {@code displayEnabled} first so a disarmed
+     * overlay pays zero reflection cost per tab entry per frame. Only when the
+     * overlay is on do we cross the classloader boundary.
+     *
+     * <p>Must never throw: runs on Lunar's render thread, once per tab entry,
      * every frame. On error we return the original name so tab still renders.
      */
-    public static String decorateName(String originalName) {
+    public static String decorateName(String originalName, Object networkPlayerInfo) {
         try {
-            if (!displayEnabled) return originalName;
-            if (originalName == null) return originalName;
-            return originalName + " [TEST]";
+            if (!displayEnabled || originalName == null) return originalName;
+            Method m = implDecorateMethod;
+            if (m == null) m = loadImpl();
+            if (m == null) return originalName;
+            return (String) m.invoke(null, originalName, networkPlayerInfo, fetchArmed);
         } catch (Throwable t) {
             return originalName;
+        }
+    }
+
+    /** Cached {@link AgentImpl#decorateInternal} handle; null until first successful lookup. */
+    private static volatile Method implDecorateMethod;
+
+    private static Method loadImpl() {
+        try {
+            Method m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                    .getMethod("decorateInternal", String.class, Object.class, boolean.class);
+            implDecorateMethod = m;
+            return m;
+        } catch (Throwable t) {
+            log("AgentImpl.decorateInternal lookup failed: " + t);
+            return null;
         }
     }
 

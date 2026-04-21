@@ -14,9 +14,12 @@ import java.util.concurrent.TimeUnit;
  * request — we never fire two lookups for the same player. Once the future
  * completes, further lookups within the TTL get the cached result directly.
  *
- * <p><b>TTL:</b> 5 minutes by default. We intentionally cache failures too (for
- * a short while) so a misconfigured key doesn't machine-gun the API — callers
- * can call {@link #invalidate} if they want to force a retry.
+ * <p><b>TTL:</b> 1 hour by default. Bedwars stats drift slowly (a few stars per
+ * hour at most), and the overlay's job is "roughly who is this" — not a live
+ * leaderboard. A longer window sharply cuts repeat fetches for players we see
+ * across multiple lobbies in one session. We intentionally cache failures too
+ * (for the same window) so a misconfigured key doesn't machine-gun the API —
+ * callers can {@link #invalidate} to force a retry.
  *
  * <p><b>Thread-safe.</b> All state lives in a {@link ConcurrentHashMap}; there
  * is no instance lock. Safe to read from any thread including the render
@@ -25,7 +28,7 @@ import java.util.concurrent.TimeUnit;
  */
 public final class StatsCache {
 
-    private static final long DEFAULT_TTL_NS = TimeUnit.MINUTES.toNanos(5);
+    private static final long DEFAULT_TTL_NS = TimeUnit.HOURS.toNanos(1);
 
     private final HypixelClient client;
     private final long ttlNs;
@@ -74,6 +77,20 @@ public final class StatsCache {
             // lookup so we pick up whatever landed.
             fresh.cancel(false);
         }
+    }
+
+    /**
+     * Read the current future for {@code uuid} <b>without</b> triggering a
+     * fetch. Returns {@code null} if nothing is cached. Safe from any thread.
+     *
+     * <p>Render-thread code uses this to distinguish "have stats / still
+     * loading / nothing yet" so we can decide between a real prefix, a
+     * {@code [...]} placeholder, or leaving the name alone — without kicking
+     * off network traffic just by looking.
+     */
+    public CompletableFuture<BedwarsStats> peekFuture(UUID uuid) {
+        Entry e = entries.get(uuid);
+        return e == null ? null : e.future;
     }
 
     /** Evict the cache entry for {@code uuid} if any. Next {@link #get} will refetch. */

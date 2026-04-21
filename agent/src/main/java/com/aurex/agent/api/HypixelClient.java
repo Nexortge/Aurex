@@ -17,6 +17,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 /**
  * Hypixel {@code /v2/player} client.
@@ -46,20 +47,39 @@ public final class HypixelClient {
     private final String apiKey;
     private final RateLimiter limiter;
     private final ExecutorService executor;
+    private final Consumer<String> logger;
     private final Gson gson = new Gson();
 
     public HypixelClient(String apiKey) {
-        this(apiKey, RateLimiter.defaultHypixel(), defaultExecutor());
+        this(apiKey, RateLimiter.defaultHypixel(), defaultExecutor(), NO_LOG);
+    }
+
+    /**
+     * Construct with a logging sink. Each completed fetch produces one line so
+     * callers can audit which UUIDs actually hit the API vs. got served from
+     * cache. The sink is called on background executor threads — keep it cheap
+     * and thread-safe. {@link #NO_LOG} disables logging entirely.
+     */
+    public HypixelClient(String apiKey, Consumer<String> logger) {
+        this(apiKey, RateLimiter.defaultHypixel(), defaultExecutor(), logger);
     }
 
     public HypixelClient(String apiKey, RateLimiter limiter, ExecutorService executor) {
+        this(apiKey, limiter, executor, NO_LOG);
+    }
+
+    public HypixelClient(String apiKey, RateLimiter limiter, ExecutorService executor, Consumer<String> logger) {
         if (apiKey == null || apiKey.isEmpty()) {
             throw new IllegalArgumentException("apiKey must not be empty");
         }
         this.apiKey = apiKey;
         this.limiter = limiter;
         this.executor = executor;
+        this.logger = logger != null ? logger : NO_LOG;
     }
+
+    /** No-op logger. Use instead of {@code null} to avoid branches on every log call. */
+    public static final Consumer<String> NO_LOG = msg -> {};
 
     /**
      * Fetch stats for a UUID.
@@ -72,12 +92,49 @@ public final class HypixelClient {
      * </ul>
      */
     public CompletableFuture<BedwarsStats> fetch(UUID uuid) {
-        return CompletableFuture.supplyAsync(() -> fetchBlocking(uuid), executor);
+        return CompletableFuture.supplyAsync(() -> fetchLogged(uuid), executor);
     }
 
     /** Graceful shutdown for the CLI harness. Agent keeps the executor alive for the JVM's life. */
     public void shutdown() {
         executor.shutdown();
+    }
+
+    /**
+     * Thin wrapper around {@link #fetchBlocking} that logs one line per
+     * completed call: outcome + total wall-clock time (queue-wait + HTTP).
+     * Separating this from the HTTP logic keeps {@code fetchBlocking} focused
+     * on the request/response itself.
+     */
+    private BedwarsStats fetchLogged(UUID uuid) {
+        long start = System.nanoTime();
+        String tag = shortUuid(uuid);
+        try {
+            BedwarsStats stats = fetchBlocking(uuid);
+            long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            if (stats == null) {
+                logger.accept("api: " + tag + " -> no-data (" + ms + "ms)");
+            } else {
+                logger.accept("api: " + tag + " -> " + stats.displayName
+                        + " ✫" + stats.stars
+                        + " FKDR=" + String.format("%.2f", stats.fkdr)
+                        + " (" + ms + "ms)");
+            }
+            return stats;
+        } catch (RuntimeException re) {
+            long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            // Unwrap the "real" cause for the log — supplyAsync wraps IOExceptions
+            // in RuntimeException in fetchBlocking; showing the cause is more useful.
+            Throwable cause = re.getCause() != null ? re.getCause() : re;
+            logger.accept("api: " + tag + " FAILED after " + ms + "ms: " + cause);
+            throw re;
+        }
+    }
+
+    /** First 8 hex chars of the undashed UUID — enough to eyeball which player without doxxing the full id in logs. */
+    private static String shortUuid(UUID uuid) {
+        String s = uuid.toString().replace("-", "");
+        return s.substring(0, 8);
     }
 
     private BedwarsStats fetchBlocking(UUID uuid) {
@@ -122,12 +179,12 @@ public final class HypixelClient {
             }
 
             // Observability: if the server tells us we're nearly out of budget,
-            // surface that to stderr. Not currently used to adjust the client-side
-            // limiter — M5 keeps the guard conservative and static; a future pass
-            // can feed RateLimit-Limit back into the limiter dynamically.
+            // surface it via the logger so it lands in agent.log. A future pass
+            // can feed RateLimit-Limit back into the limiter dynamically to raise
+            // the floor for higher-tier keys.
             int remaining = parseIntHeader(conn, "RateLimit-Remaining", -1);
             if (remaining >= 0 && remaining < 5) {
-                System.err.println("[HypixelClient] low RateLimit-Remaining=" + remaining);
+                logger.accept("api: WARN low RateLimit-Remaining=" + remaining);
             }
 
             InputStream in = conn.getInputStream();

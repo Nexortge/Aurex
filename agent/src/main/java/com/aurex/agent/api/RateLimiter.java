@@ -9,7 +9,7 @@ import java.util.concurrent.TimeUnit;
  * Dashboard, not a fixed number — responses include {@code RateLimit-Limit},
  * {@code RateLimit-Remaining}, {@code RateLimit-Reset} headers that describe
  * the live budget. This class is a conservative client-side floor (default
- * 110/min, burst 10) so we never punch past a modest default tier even if the
+ * 30/min, burst 16) so we never punch past a modest default tier even if the
  * server hasn't had a chance to tell us the real ceiling yet.
  * {@link HypixelClient} observes the response headers and handles 429s; a
  * future iteration can feed observed {@code RateLimit-Limit} back in to raise
@@ -42,9 +42,9 @@ public final class RateLimiter {
         this.lastRefillNs = System.nanoTime();
     }
 
-    /** Defaults: 110 req/min, burst of 10. */
+    /** Defaults: 30 req/min (≈1 token every 2s), burst of 16. */
     public static RateLimiter defaultHypixel() {
-        return new RateLimiter(110, 10);
+        return new RateLimiter(30, 16);
     }
 
     /**

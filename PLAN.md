@@ -110,14 +110,23 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 
 ---
 
-## M6 — Wire stats into tab
+## M6 — Wire stats into tab — **Done (2026-04-21).**
 
 **Goal:** The actual feature works end-to-end. Tab entries show real Bedwars stats.
 
+**What shipped in code:**
+- `AgentImpl` (bootstrap-only) owns the `StatsCache` + `HypixelClient` and formats the prefix. Kept separate from `Agent` because Lunar's MC loader can't see `com.aurex.agent.api.*` or `com.google.gson.*` — Agent (which lives on MC loader) reflectively forwards across to AgentImpl on bootstrap.
+- `TabOverlayTransformer` now pushes `ALOAD 1` (the `NetworkPlayerInfo` param) before the decorate INVOKESTATIC, so the hook receives the NPI and can reach UUID via reflective `getGameProfile().getId()`.
+- `Agent.decorateName(String, Object)` gates on `displayEnabled`, then hops to `AgentImpl.decorateInternal(String, Object, boolean)` with the cached Method handle. `fetchArmed` is passed so the 3s arm window still gates new fetches; once cached, stats stay visible until `AX-off`.
+- `StatsCache.peekFuture(UUID)` added so render-thread reads don't trigger fetches just by looking.
+- Prefix format `§<c>[<stars>✫ <fkdr>]§r ` with standard Bedwars prestige colors (0-99 gray → 900 amethyst; 1000+ placeholder solid gold, rainbow is M8 territory).
+- `AgentImpl` is preloaded at `premain` via `Class.forName(..., null)` so API-key load + client construction don't run on the render thread.
+
 **Deliverable:**
 - On tab render, for each `NetworkPlayerInfo` in view, look up stats from cache
-- If cached: prepend `[⭐350 | 2.5] ` (star + FKDR) with color-coded star tier
-- If not cached: kick off async fetch, show `[...]` placeholder
+- If cached: prepend `[<stars>✫ <fkdr>]` with color-coded star tier
+- If miss + armed: kick off async fetch, show `[...]` placeholder
+- If miss + not armed: leave the name alone (no phantom `[...]` after the arm window closes)
 - Star tier colors follow the standard Bedwars prestige palette (stone → iron → gold → diamond → emerald → sapphire → ruby → crystal → opal → amethyst → rainbow)
 
 **Success check:** Join a Bedwars lobby, open tab, see real stats for real players.
