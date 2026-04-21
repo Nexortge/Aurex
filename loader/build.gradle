@@ -1,16 +1,22 @@
 // Loader = the small CLI program you run from OUTSIDE Lunar.
-// Its one job: find Lunar's JVM and attach the agent jar to it.
+// Its jobs:
+//   1. Attach the agent jar to a running Lunar JVM (M1-era path; blocked
+//      today by -XX:+DisableAttachMechanism but kept for future use).
+//   2. Run test harnesses (`test-api`, `test-cache`, ...) that exercise
+//      agent code standalone — without needing to launch Lunar. Cuts the
+//      debug loop from "restart Lunar + check logs" to "re-run jar".
 
 dependencies {
     // tools.jar ships with JDK 8 and contains the Attach API
-    // (com.sun.tools.attach.VirtualMachine). It's not on the default
-    // classpath — we have to name it explicitly.
-    //
-    // `compileOnly` = needed to compile, NOT bundled into our jar. At
-    // runtime, the loader will locate tools.jar from the running JDK's
-    // java.home and add it to the classloader dynamically. This way we
-    // don't have to ship Oracle's tools.jar ourselves.
+    // (com.sun.tools.attach.VirtualMachine). Not on the default classpath —
+    // we name it explicitly. compileOnly = needed to compile, NOT bundled
+    // into our jar (runtime picks it up from java.home).
     compileOnly files("${System.properties['java.home']}/../lib/tools.jar")
+
+    // Pull in the agent subproject so the CLI can reuse classes like
+    // HypixelClient / StatsCache / BedwarsStats directly. Keeps the
+    // networking code in one place — M6 uses the same classes inside Lunar.
+    implementation project(':agent')
 }
 
 jar {
@@ -19,11 +25,23 @@ jar {
     manifest {
         attributes(
             // Main-Class makes `java -jar aurex-loader.jar` work, and
-            // also makes the jar clickable on Windows (if .jar is associated
-            // with javaw.exe).
+            // also makes the jar clickable on Windows.
             'Main-Class': 'com.aurex.loader.Main',
             'Implementation-Title': 'Aurex Loader',
             'Implementation-Version': project.version ?: '0.0.1'
         )
     }
+
+    // Fat-jar the loader too: bundle agent classes + Gson + anything else
+    // on the runtime classpath. Lets users run `java -jar aurex-loader.jar
+    // test-api <uuid>` without a separate classpath. Excluding .SF/.DSA/.RSA
+    // avoids jar signature verification errors when merging signed deps.
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    exclude 'META-INF/*.SF'
+    exclude 'META-INF/*.DSA'
+    exclude 'META-INF/*.RSA'
+
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }

@@ -8,22 +8,37 @@ import java.net.URLClassLoader;
 /**
  * Loader entry point. Run from a JDK 8 installation — NOT a bare JRE.
  *
- * Usage:
- *   java -jar aurex-loader.jar                       auto-discover Lunar
+ * <h2>Modes</h2>
+ * <pre>
+ *   java -jar aurex-loader.jar                       attach agent to Lunar (auto-discover)
  *   java -jar aurex-loader.jar --pid 2368            attach to explicit PID
  *   java -jar aurex-loader.jar --agent C:\...\agent.jar
  *   java -jar aurex-loader.jar --pid 2368 --agent ...
  *
- * Why Main is separate from {@link Attacher}:
- *   com.sun.tools.attach.* lives in the JDK's tools.jar, which is NOT on
- *   the default Java classpath. Main appends tools.jar to the system
- *   classloader first, then loads Attacher (which imports those classes).
- *   Java's lazy class-linking makes the ordering safe.
+ *   java -jar aurex-loader.jar test-api &lt;uuid&gt;       run the M5 API harness
+ * </pre>
+ *
+ * <p>The {@code test-api} subcommand skips the whole attach flow — it's a
+ * standalone test harness that exercises {@link com.aurex.agent.api.HypixelClient}
+ * without needing Lunar running. See {@link ApiTest} for the actual work.
+ *
+ * <h2>Why Main is separate from {@link Attacher}</h2>
+ * {@code com.sun.tools.attach.*} lives in the JDK's tools.jar, which is NOT on
+ * the default Java classpath. Main appends tools.jar to the system classloader
+ * first, then loads Attacher (which imports those classes). Java's lazy
+ * class-linking makes the ordering safe.
  */
 public final class Main {
     private Main() {}
 
     public static void main(String[] args) throws Exception {
+        // Subcommand dispatch. Attach path is still the default (args are positional /
+        // flag-style) so existing `java -jar aurex-loader.jar` invocations keep working.
+        if (args.length > 0 && "test-api".equals(args[0])) {
+            ApiTest.run(rest(args));
+            return;
+        }
+
         System.out.println("Aurex loader v0.0.1 -- M1");
 
         Args parsed = Args.parse(args);
@@ -60,6 +75,13 @@ public final class Main {
         Method runMethod = attacherClass.getMethod("run", String.class, String.class);
         // First arg = agent path. Second arg = explicit PID, or null to auto-discover.
         runMethod.invoke(null, agentJar.getAbsolutePath(), parsed.pid);
+    }
+
+    /** Slice off argv[0] (the subcommand name) before handing to subcommand handlers. */
+    private static String[] rest(String[] args) {
+        String[] out = new String[args.length - 1];
+        System.arraycopy(args, 1, out, 0, out.length);
+        return out;
     }
 
     /** CLI args in a small holder, parsed with zero libraries. */
