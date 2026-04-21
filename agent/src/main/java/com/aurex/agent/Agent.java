@@ -245,11 +245,40 @@ public final class Agent {
                         + " fetch=" + (fetchArmed ? "armed" : "idle"));
                 return true;
             }
+            // Typo guard: anything that LOOKS like a botched AX command —
+            // starts with "ax" (case-insensitive), optional space, then dash or
+            // underscore — gets swallowed and hinted instead of broadcasting
+            // the typo to public chat. Catches "AX-onn", "ax-stats", "AX_on",
+            // "ax -on", "AX _status", etc.
+            if (looksLikeAxCommand(trimmed)) {
+                sendClientChat("§e[AX] unknown: \"" + trimmed
+                        + "\" — try AX-on / AX-off / AX-status");
+                log("swallowed unknown AX command: " + trimmed);
+                return true;
+            }
             return false;
         } catch (Throwable t) {
             log("onOutgoingChat failed: " + t);
             return false;
         }
+    }
+
+    /**
+     * Shape-match a message against the "possibly-an-AX-command" pattern:
+     * {@code ^[aA][xX] ?[-_]}. If true, the caller swallows the message and
+     * prints a client-side hint — the goal is to keep typos like {@code ax_on}
+     * or {@code AX -status} off public chat.
+     */
+    private static boolean looksLikeAxCommand(String s) {
+        if (s.length() < 3) return false;
+        char c0 = Character.toLowerCase(s.charAt(0));
+        char c1 = Character.toLowerCase(s.charAt(1));
+        if (c0 != 'a' || c1 != 'x') return false;
+        int i = 2;
+        if (s.charAt(i) == ' ') i++;
+        if (i >= s.length()) return false;
+        char sep = s.charAt(i);
+        return sep == '-' || sep == '_';
     }
 
     private static void arm() {

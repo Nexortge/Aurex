@@ -38,17 +38,19 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class AgentImpl {
 
     // Standard Bedwars prestige colors. Each 100 stars = next tier.
-    private static final String C_GRAY  = "§7";
-    private static final String C_WHITE = "§f";
-    private static final String C_GOLD  = "§6";
-    private static final String C_AQUA  = "§b";
-    private static final String C_DG    = "§2"; // dark green — emerald
-    private static final String C_DA    = "§3"; // dark aqua — sapphire
-    private static final String C_DR    = "§4"; // dark red — ruby
-    private static final String C_LP    = "§d"; // light purple — crystal
-    private static final String C_BLUE  = "§9"; // blue — opal
-    private static final String C_DP    = "§5"; // dark purple — amethyst
-    private static final String RESET   = "§r";
+    private static final String C_GRAY   = "§7";
+    private static final String C_WHITE  = "§f";
+    private static final String C_YELLOW = "§e";
+    private static final String C_GOLD   = "§6";
+    private static final String C_RED    = "§c";
+    private static final String C_AQUA   = "§b";
+    private static final String C_DG     = "§2"; // dark green — emerald
+    private static final String C_DA     = "§3"; // dark aqua — sapphire
+    private static final String C_DR     = "§4"; // dark red — ruby
+    private static final String C_LP     = "§d"; // light purple — crystal
+    private static final String C_BLUE   = "§9"; // blue — opal
+    private static final String C_DP     = "§5"; // dark purple — amethyst
+    private static final String RESET    = "§r";
 
     /** Shown while a fetch is in flight. Trailing space so it butts up against the original name. */
     private static final String PLACEHOLDER = C_GRAY + "[...]" + RESET + " ";
@@ -70,6 +72,12 @@ public final class AgentImpl {
      * loader copies and static state doesn't cross between them.
      */
     private static final Set<UUID> alertedNicks = ConcurrentHashMap.newKeySet();
+
+    /**
+     * UUIDs we've already logged as "skipped (NPC/info row)". Dedup'd so the
+     * log doesn't fill up every frame. Same lifecycle as {@link #alertedNicks}.
+     */
+    private static final Set<UUID> skippedNicks = ConcurrentHashMap.newKeySet();
 
     /**
      * First MC-loader we see an NPI through, cached for {@link Agent#sendClientChat}.
@@ -163,11 +171,27 @@ public final class AgentImpl {
      * persists as long as the cache entry does.
      */
     private static String handleNick(UUID uuid, String originalName) {
+        // Real Mojang-minted player UUIDs are always v4 (random). Hypixel
+        // assigns v2/v3 UUIDs to server-generated entities (lobby NPCs,
+        // shopkeepers, Firework Frank, etc.) — filter those by version nibble.
+        // Cheaper and more accurate than any name-shape heuristic.
+        if (uuid.version() != 4) {
+            if (skippedNicks.add(uuid)) {
+                Agent.log("nick skipped (non-v4 UUID, likely NPC): original='" + originalName + "' uuid=" + uuid);
+            }
+            return originalName;
+        }
+
         String alertName = extractAlertName(originalName);
-        if (alertName == null) return originalName;   // NPC / info row / weird formatting — leave alone
+        if (alertName == null) {
+            if (skippedNicks.add(uuid)) {
+                Agent.log("nick skipped (name-shape fail): original='" + originalName + "' uuid=" + uuid);
+            }
+            return originalName;
+        }
 
         if (alertedNicks.add(uuid)) {
-            Agent.log("nick detected: " + alertName + " (" + shortUuid(uuid) + ")");
+            Agent.log("nick detected: name='" + alertName + "' uuid=" + uuid);
             Agent.sendClientChat(C_DR + "[AX] -> " + alertName + " is nicked!" + RESET,
                     capturedMcLoader);
         }
@@ -202,11 +226,6 @@ public final class AgentImpl {
         return candidate;
     }
 
-    private static String shortUuid(UUID uuid) {
-        String s = uuid.toString().replace("-", "");
-        return s.substring(0, 8);
-    }
-
     /**
      * Drop the "we've already alerted for these UUIDs" set. Called from
      * {@link Agent#disarm(boolean)} via reflection so the MC-loader copy of
@@ -215,6 +234,7 @@ public final class AgentImpl {
      */
     public static void clearNickAlerts() {
         alertedNicks.clear();
+        skippedNicks.clear();
     }
 
     /**
@@ -244,8 +264,8 @@ public final class AgentImpl {
     }
 
     private static String formatStatsPrefix(BedwarsStats s) {
-        return starColor(s.stars) + "[" + s.stars + "✫ "
-                + String.format("%.2f", s.fkdr) + "]" + RESET;
+        return starColor(s.stars) + "[" + s.stars + "✫]" + RESET
+                + " " + fkdrColor(s.fkdr) + "[" + String.format("%.2f", s.fkdr) + "]" + RESET;
     }
 
     /**
@@ -266,5 +286,14 @@ public final class AgentImpl {
         if (stars < 900)  return C_BLUE;
         if (stars < 1000) return C_DP;
         return C_GOLD;
+    }
+
+    /** Skill tiers for FKDR: <1 gray, 1-3 white, 3-5 yellow, 5-10 red, 10+ dark red. */
+    private static String fkdrColor(double fkdr) {
+        if (fkdr < 1)  return C_GRAY;
+        if (fkdr < 3)  return C_WHITE;
+        if (fkdr < 5)  return C_YELLOW;
+        if (fkdr < 10) return C_RED;
+        return C_DR;
     }
 }
