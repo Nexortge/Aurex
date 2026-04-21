@@ -183,6 +183,29 @@ public final class Agent {
         }
     }
 
+    /**
+     * Full-tab-replacement gate. Called from the HEAD of
+     * {@code GuiPlayerTabOverlay#renderPlayerlist} immediately after
+     * {@link #onTabRender()}. Return {@code true} to tell the injected bytecode
+     * to {@code RETURN} — vanilla's body is skipped and we've drawn our own
+     * tab. Return {@code false} to fall through to the vanilla renderer.
+     *
+     * <p>Gate order: if {@link #displayEnabled} is off we always return false
+     * so AX-off users see unmodified vanilla tab. When on we hand off to
+     * {@link TabRenderer#render(int)} which owns the actual drawing.
+     *
+     * <p>Must never throw — on error we return false so the user at least
+     * keeps vanilla tab instead of losing it entirely to a crash.
+     */
+    public static boolean renderAurexTab(int width) {
+        try {
+            if (!displayEnabled) return false;
+            return TabRenderer.render(width);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     // ---- M3.5: arm/disarm gate ------------------------------------------------
 
     /**
@@ -384,6 +407,41 @@ public final class Agent {
             return m;
         } catch (Throwable t) {
             log("AgentImpl.decorateInternal lookup failed: " + t);
+            return null;
+        }
+    }
+
+    /**
+     * Reflective hop to {@code AgentImpl.getTableRows}. Called by
+     * {@link TabRenderer} once per tab frame (while AX-on) to get the
+     * preformatted row data. Same classloader bridge pattern as
+     * {@link #decorateName(String, Object)}.
+     *
+     * <p>Returns {@code null} on any failure so the caller can fall back to
+     * vanilla — never throws.
+     */
+    @SuppressWarnings("unchecked")
+    public static java.util.List<String[]> getTableRows(Object[] npis) {
+        try {
+            Method m = implGetTableRowsMethod;
+            if (m == null) m = loadGetTableRows();
+            if (m == null) return null;
+            return (java.util.List<String[]>) m.invoke(null, npis, fetchArmed);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static volatile Method implGetTableRowsMethod;
+
+    private static Method loadGetTableRows() {
+        try {
+            Method m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                    .getMethod("getTableRows", Object[].class, boolean.class);
+            implGetTableRowsMethod = m;
+            return m;
+        } catch (Throwable t) {
+            log("AgentImpl.getTableRows lookup failed: " + t);
             return null;
         }
     }

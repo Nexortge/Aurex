@@ -6,6 +6,10 @@ import com.aurex.agent.api.HypixelClient;
 import com.aurex.agent.api.StatsCache;
 
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -88,12 +92,39 @@ public final class AgentImpl {
      */
     private static volatile ClassLoader capturedMcLoader;
 
-    // Reflection cache for NetworkPlayerInfo#getGameProfile()#getId().
+    // Reflection cache for NetworkPlayerInfo#getGameProfile()#getId() / getName().
     // Can't compile-time reference net.minecraft.* from bootstrap — MC classes
     // live on Lunar's MC loader, not bootstrap — so reflection is the only
     // loader-agnostic way in.
     private static volatile Method npiGetGameProfile;
     private static volatile Method gameProfileGetId;
+    private static volatile Method gameProfileGetName;
+
+    // Vanilla-name-formatting reflection cache. Used to reproduce
+    // GuiPlayerTabOverlay.getPlayerName without going through our own M4
+    // decorator — so ranks + team colors survive the M8 table render.
+    private static volatile Method npiGetDisplayName;
+    private static volatile Method npiGetPlayerTeam;
+    private static volatile Method componentGetFormattedText;
+    private static volatile Method teamGetRegisteredName;
+    private static volatile Method scorePlayerTeamFormatPlayerName;
+    private static volatile Class<?> spTeamClass;
+    private static volatile Class<?> teamInterfaceClass;
+
+    // --- M8 row-build column schema ----------------------------------------
+    // Each row returned by getTableRows is a String[5], pre-formatted with
+    // §-codes. Index constants keep the contract readable on both sides.
+    public static final int COL_STARS = 0;
+    public static final int COL_NAME  = 1;
+    public static final int COL_FKDR  = 2;
+    public static final int COL_WL    = 3;
+    public static final int COL_WINS  = 4;
+    public static final int COL_COUNT = 5;
+
+    /** Cell shown when stats are not yet known (armed + fetching, or fetch idle). */
+    private static final String CELL_PLACEHOLDER = C_GRAY + "[...]" + RESET;
+    /** Cell shown when lookup finished but player has no Bedwars data (nicked / never played). */
+    private static final String CELL_UNKNOWN     = C_GRAY + "—" + RESET;
 
     private AgentImpl() {}
 
@@ -235,6 +266,327 @@ public final class AgentImpl {
     public static void clearNickAlerts() {
         alertedNicks.clear();
         skippedNicks.clear();
+    }
+
+    /**
+     * Build one tab row per viable {@code NetworkPlayerInfo}. Called from
+     * {@link Agent#getTableRows(Object[])} via the standard bootstrap hop.
+     *
+     * <p>Returns a list of {@link #COL_COUNT}-element {@code String[]} rows
+     * with §-color codes baked in. Contract:
+     * <pre>
+     *   [COL_STARS] "§e[123✫]"                star bracket with prestige color
+     *   [COL_NAME ] "§fNexort"                player name (with [NICK]/[...] tag baked if applicable)
+     *   [COL_FKDR ] "§c[7.42]" / "§7[...]"    FKDR with skill-tier color, or placeholder
+     *   [COL_WL   ] "§f2.10"  / "§7—"         W/L ratio or dash-unknown
+     *   [COL_WINS ] "§f1,234" / "§7—"         wins or dash-unknown
+     * </pre>
+     *
+     * <p>Filters: non-v4 UUIDs (NPCs per
+     * {@code memory/project_hypixel_tab_hazards.md}) and null names.
+     *
+     * <p>Sort: real players by FKDR descending, then nicks (top), then
+     * unknown/loading (bottom). This mirrors Seraph's convention of showing
+     * the best players first while making missing-data rows obvious.
+     *
+     * <p>Side effect: for cache-miss + {@code fetchArmed}, kicks off the same
+     * async fetch {@link #decorateInternal} did. Since M8 bypasses the vanilla
+     * {@code getPlayerName} path, this is now the only place new fetches
+     * originate from the render thread.
+     */
+    public static List<String[]> getTableRows(Object[] npis, boolean fetchArmed) {
+        if (npis == null || statsCache == null) return Collections.emptyList();
+        try {
+            List<RawRow> raws = new ArrayList<RawRow>(npis.length);
+            for (Object npi : npis) {
+                if (npi == null) continue;
+                if (capturedMcLoader == null) capturedMcLoader = npi.getClass().getClassLoader();
+
+                UUID uuid = extractUuid(npi);
+                if (uuid == null) continue;
+                if (uuid.version() != 4) continue;  // NPC filter (M7 learning)
+
+                String name = extractName(npi);
+                if (name == null) continue;
+
+                raws.add(buildRawRow(npi, uuid, name, fetchArmed));
+            }
+
+            // Sort: NICK (has alertName, was 404/no-stats) on top, then REAL
+            // players by FKDR desc, then PLACEHOLDER/UNKNOWN at bottom.
+            raws.sort(ROW_ORDER);
+
+            List<String[]> rows = new ArrayList<String[]>(raws.size());
+            for (RawRow r : raws) rows.add(formatRow(r));
+            return rows;
+        } catch (Throwable t) {
+            Agent.log("getTableRows failed: " + t);
+            return Collections.emptyList();
+        }
+    }
+
+    /** Row status — drives sort + formatting branches. */
+    private enum RowStatus { REAL, NICK, PLACEHOLDER, UNKNOWN }
+
+    /**
+     * Intermediate per-row struct pre-formatting. Never escapes this class.
+     *
+     * <p>{@code rawName} = plain 16-char MC username (for nick alerts + logs).
+     * {@code displayName} = formatted string with rank prefix + team color baked
+     * in, via vanilla's {@code getPlayerName} logic. {@code teamKey} is the
+     * scoreboard team's registered name, used as the primary sort axis so we
+     * match vanilla's team-grouped ordering (which is what gives Hypixel its
+     * rank-stratified tab list).
+     */
+    private static final class RawRow {
+        final UUID uuid;
+        final String rawName;
+        final String displayName;
+        final String teamKey;
+        final BedwarsStats stats;   // null unless REAL
+        final RowStatus status;
+        RawRow(UUID uuid, String rawName, String displayName, String teamKey,
+               BedwarsStats stats, RowStatus status) {
+            this.uuid = uuid; this.rawName = rawName; this.displayName = displayName;
+            this.teamKey = teamKey; this.stats = stats; this.status = status;
+        }
+    }
+
+    private static RawRow buildRawRow(Object npi, UUID uuid, String rawName, boolean fetchArmed) {
+        String display = extractDisplayName(npi, rawName);
+        String teamKey = extractTeamKey(npi);
+
+        CompletableFuture<BedwarsStats> fut = statsCache.peekFuture(uuid);
+        if (fut == null) {
+            if (fetchArmed) {
+                statsCache.get(uuid);   // kick off async fetch
+                return new RawRow(uuid, rawName, display, teamKey, null, RowStatus.PLACEHOLDER);
+            }
+            return new RawRow(uuid, rawName, display, teamKey, null, RowStatus.UNKNOWN);
+        }
+        if (!fut.isDone()) return new RawRow(uuid, rawName, display, teamKey, null, RowStatus.PLACEHOLDER);
+        if (fut.isCompletedExceptionally()) return new RawRow(uuid, rawName, display, teamKey, null, RowStatus.UNKNOWN);
+
+        BedwarsStats stats = fut.getNow(null);
+        if (stats == null) {
+            // nick / never-played — same branch as decorateInternal.handleNick.
+            // Alert is deduped across M8 and M4 paths because alertedNicks is shared.
+            if (alertedNicks.add(uuid)) {
+                Agent.log("nick detected (table): name='" + rawName + "' uuid=" + uuid);
+                Agent.sendClientChat(C_DR + "[AX] -> " + rawName + " is nicked!" + RESET,
+                        capturedMcLoader);
+            }
+            return new RawRow(uuid, rawName, display, teamKey, null, RowStatus.NICK);
+        }
+        return new RawRow(uuid, rawName, display, teamKey, stats, RowStatus.REAL);
+    }
+
+    /**
+     * Sort: by scoreboard team name first (groups team colors together, matches
+     * vanilla's rank-stratified lobby order), then within a team NICK on top,
+     * REAL by FKDR desc, then loading/unknown.
+     *
+     * <p>In Bedwars matches this groups red/blue/green/yellow teams. In lobbies
+     * where there are no game teams, Hypixel assigns scoreboard teams by rank
+     * ([MVP++] before [MVP+] before default) so team-key sort reproduces the
+     * vanilla rank stratification users expect.
+     */
+    private static final Comparator<RawRow> ROW_ORDER = new Comparator<RawRow>() {
+        @Override public int compare(RawRow a, RawRow b) {
+            int t = a.teamKey.compareTo(b.teamKey);
+            if (t != 0) return t;
+            int ra = rank(a.status), rb = rank(b.status);
+            if (ra != rb) return ra - rb;
+            if (a.status == RowStatus.REAL) {
+                return Double.compare(b.stats.fkdr, a.stats.fkdr);  // desc within team
+            }
+            return a.rawName.compareToIgnoreCase(b.rawName);
+        }
+        private int rank(RowStatus s) {
+            switch (s) {
+                case NICK: return 0;
+                case REAL: return 1;
+                case PLACEHOLDER: return 2;
+                default: return 3; // UNKNOWN
+            }
+        }
+    };
+
+    private static String[] formatRow(RawRow r) {
+        String[] cells = new String[COL_COUNT];
+        // Name cell: use vanilla's formatted display name — rank prefix + team
+        // color already baked in. Don't wrap in our own color code; that would
+        // clobber the team color. RESET appended so later cells start clean.
+        String nameCell = r.displayName + RESET;
+        switch (r.status) {
+            case REAL: {
+                BedwarsStats s = r.stats;
+                cells[COL_STARS] = starColor(s.stars) + "[" + s.stars + "✫]" + RESET;
+                cells[COL_NAME ] = nameCell;
+                cells[COL_FKDR ] = fkdrColor(s.fkdr) + "[" + String.format("%.2f", s.fkdr) + "]" + RESET;
+                cells[COL_WL   ] = C_WHITE + String.format("%.2f", s.wlr) + RESET;
+                cells[COL_WINS ] = C_WHITE + formatInt(s.wins) + RESET;
+                break;
+            }
+            case NICK: {
+                cells[COL_STARS] = C_DR + "[NICK]" + RESET;
+                cells[COL_NAME ] = nameCell;
+                cells[COL_FKDR ] = CELL_UNKNOWN;
+                cells[COL_WL   ] = CELL_UNKNOWN;
+                cells[COL_WINS ] = CELL_UNKNOWN;
+                break;
+            }
+            case PLACEHOLDER: {
+                cells[COL_STARS] = CELL_PLACEHOLDER;
+                cells[COL_NAME ] = nameCell;
+                cells[COL_FKDR ] = CELL_PLACEHOLDER;
+                cells[COL_WL   ] = CELL_PLACEHOLDER;
+                cells[COL_WINS ] = CELL_PLACEHOLDER;
+                break;
+            }
+            case UNKNOWN:
+            default: {
+                cells[COL_STARS] = CELL_UNKNOWN;
+                cells[COL_NAME ] = nameCell;
+                cells[COL_FKDR ] = CELL_UNKNOWN;
+                cells[COL_WL   ] = CELL_UNKNOWN;
+                cells[COL_WINS ] = CELL_UNKNOWN;
+                break;
+            }
+        }
+        return cells;
+    }
+
+    /** 1234 → "1,234". Locale-agnostic, thousands separator only. */
+    private static String formatInt(int n) {
+        return String.format("%,d", n);
+    }
+
+    /**
+     * Vanilla-equivalent formatted display name for the Name column. Mirrors
+     * {@code GuiPlayerTabOverlay.getPlayerName} decision tree:
+     * <ol>
+     *   <li>If {@code npi.getDisplayName()} is non-null (Hypixel sets this with
+     *       the full {@code §9[MVP§d++§9] §cNexort} string) — return its
+     *       formatted text.</li>
+     *   <li>Else if a scoreboard team is assigned — run the raw name through
+     *       {@code ScorePlayerTeam.formatPlayerName(team, raw)} to get
+     *       {@code prefix + name + suffix} with team color.</li>
+     *   <li>Else — return the raw username.</li>
+     * </ol>
+     *
+     * <p>We bypass vanilla's {@code getPlayerName} directly because that method
+     * is patched by our M4 transformer to call {@code decorateName}, which would
+     * append a stats prefix — exactly what we're already rendering in separate
+     * columns. Replicating the upstream logic skips the decorator cleanly.
+     *
+     * <p>Never throws — falls back to {@code rawName} on any reflection failure.
+     */
+    private static String extractDisplayName(Object npi, String rawName) {
+        try {
+            Method mDisp = npiGetDisplayName;
+            if (mDisp == null) {
+                mDisp = npi.getClass().getMethod("getDisplayName");
+                npiGetDisplayName = mDisp;
+            }
+            Object comp = mDisp.invoke(npi);
+            if (comp != null) {
+                Method mFmt = componentGetFormattedText;
+                if (mFmt == null) {
+                    mFmt = comp.getClass().getMethod("getFormattedText");
+                    componentGetFormattedText = mFmt;
+                }
+                Object txt = mFmt.invoke(comp);
+                if (txt != null) return (String) txt;
+            }
+            Object team = extractTeam(npi);
+            ClassLoader loader = capturedMcLoader;
+            if (team != null && loader != null) {
+                Class<?> spt = spTeamClass;
+                if (spt == null) {
+                    spt = Class.forName("net.minecraft.scoreboard.ScorePlayerTeam", true, loader);
+                    spTeamClass = spt;
+                }
+                Class<?> tif = teamInterfaceClass;
+                if (tif == null) {
+                    tif = Class.forName("net.minecraft.scoreboard.Team", true, loader);
+                    teamInterfaceClass = tif;
+                }
+                Method mFmtName = scorePlayerTeamFormatPlayerName;
+                if (mFmtName == null) {
+                    mFmtName = spt.getMethod("formatPlayerName", tif, String.class);
+                    scorePlayerTeamFormatPlayerName = mFmtName;
+                }
+                Object res = mFmtName.invoke(null, team, rawName);
+                if (res != null) return (String) res;
+            }
+        } catch (Throwable t) {
+            // swallow; fall back to rawName
+        }
+        return rawName;
+    }
+
+    /** {@code npi.getPlayerTeam()}. Null if the player isn't in a scoreboard team. */
+    private static Object extractTeam(Object npi) {
+        try {
+            Method m = npiGetPlayerTeam;
+            if (m == null) {
+                m = npi.getClass().getMethod("getPlayerTeam");
+                npiGetPlayerTeam = m;
+            }
+            return m.invoke(npi);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Scoreboard team's registered name for sort ordering. Empty string if the
+     * player has no team — keeps untagged players together. Team names on
+     * Hypixel are typically prefixed with priority markers (e.g. {@code "0000_MVPPP"})
+     * so lexicographic sort reproduces the rank-stratified vanilla order.
+     */
+    private static String extractTeamKey(Object npi) {
+        Object team = extractTeam(npi);
+        if (team == null) return "";
+        try {
+            Method m = teamGetRegisteredName;
+            if (m == null) {
+                m = team.getClass().getMethod("getRegisteredName");
+                teamGetRegisteredName = m;
+            }
+            Object name = m.invoke(team);
+            return name != null ? (String) name : "";
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /**
+     * Read the player's raw username from {@code npi.getGameProfile().getName()}.
+     * Distinct from {@code getPlayerName(npi)} — that returns the team-formatted
+     * display name (with rank prefix baked in). For the table's Name column we
+     * want the plain 16-char username.
+     */
+    private static String extractName(Object npi) {
+        if (npi == null) return null;
+        try {
+            Method mA = npiGetGameProfile;
+            if (mA == null) {
+                mA = npi.getClass().getMethod("getGameProfile");
+                npiGetGameProfile = mA;
+            }
+            Object profile = mA.invoke(npi);
+            if (profile == null) return null;
+            Method mB = gameProfileGetName;
+            if (mB == null) {
+                mB = profile.getClass().getMethod("getName");
+                gameProfileGetName = mB;
+            }
+            return (String) mB.invoke(profile);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     /**

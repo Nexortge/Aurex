@@ -28,7 +28,8 @@ final class AgentPublisher {
      *  otherwise MC loader can't resolve it at runtime. */
     private static final String[] CLASSES = {
             "com.aurex.agent.Agent",
-            "com.aurex.agent.DisarmTask"
+            "com.aurex.agent.DisarmTask",
+            "com.aurex.agent.TabRenderer"
     };
 
     private static volatile boolean published;

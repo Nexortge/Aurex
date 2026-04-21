@@ -155,18 +155,29 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 
 ---
 
-## M8 — Table-style tab layout (big UX swing)
+## M8 — Table-style tab layout — **Done (2026-04-21, teams-of-one verified).**
 
 **Goal:** Replace the default tab rendering with a full columnar table: `Stars | Name | FKDR | W/L | Wins`.
 
-**Deliverable:**
-- Redirect the render method: instead of letting the vanilla render run, call our own renderer that draws a table using `FontRenderer.drawString` and `Gui.drawRect`
-- Columns align, header row, dynamic width based on longest name
-- Toggle with a keybind (default: same as vanilla tab, but hold Shift for table view)
+**What shipped in code:**
+- New `TabRenderer` class on Lunar's MC loader (published by `AgentPublisher` alongside `Agent` + `DisarmTask`). Reflection-only for every `net.minecraft.*` touch so the agent still compiles without MC libs on the classpath. Must never throw from `render(int)` — catches `Throwable` and returns `false` to fall back to vanilla.
+- `TabOverlayTransformer.patchRenderPlayerlist` swapped from single `INVOKESTATIC` to a conditional early-return at HEAD: `Agent.onTabRender()V`; `ILOAD 1`; `Agent.renderAurexTab(I)Z`; `IFEQ skip`; `RETURN`; `skip: F_SAME`. The `FrameNode` is mandatory (cf. `memory/project_asm_branch_target_frames.md`).
+- `Agent.renderAurexTab(int)` = thin gate — checks `displayEnabled` then delegates to `TabRenderer.render`. Always-on once `AX-on`; no Shift toggle.
+- `Agent.getTableRows(Object[])` hops across to `AgentImpl.getTableRows` (bootstrap) carrying the `NetworkPlayerInfo[]`. Data crossing the loader boundary is `java.*` only (`List<String[]>`) so both loaders resolve.
+- `AgentImpl.getTableRows` reads `StatsCache` via `peekFuture` (no fetch kickoff) per row, then fires a fetch when `fetchArmed && displayEnabled && UUID is v4`. Fetch trigger lives here now because vanilla `getPlayerName` is skipped under M8 early-return so the M4 decorator path no longer runs.
+- Row layout: `[✫ stars | name | FKDR | W/L | Wins]` with §-codes baked in by `AgentImpl` and drawn as-is by `TabRenderer`.
+- **Ranks + team colors:** instead of using `gameProfile.getName()`, we replicate vanilla's upstream chain — `npi.getDisplayName().getFormattedText()` first (Hypixel sets this for rank prefixes like `[MVP++]`), then `ScorePlayerTeam.formatPlayerName(team, raw)`, then plain `rawName`. This deliberately skips our own M4 `decorateName` hook so stats don't leak back into the name cell.
+- **Sort order:** primary key = scoreboard team registered name (Hypixel uses `0000_MVPPP`, `0001_MVPP`, … so lex order reproduces rank stratification in lobby and team grouping in a Bedwars match). Secondary = status rank (NICK → REAL → PLACEHOLDER → UNKNOWN). Tertiary within REAL = FKDR desc; else name alphabetical.
+- NPC / info-row filter: v4-UUID check pre-fetch (Hypixel NPCs are v2 UUIDs) so we don't burn rate-limit slots on decorative rows.
+- Nick alert dedup shares `alertedNicks` set with the M4/M7 decorator path, so a nick is announced once per UUID per arm/disarm cycle regardless of which path detected it.
 
-**Success check:** Hold tab + shift in a Bedwars lobby, see table-style layout.
+**Known gaps / polish that moved into later milestones:**
+- Stars/FKDR/W/L/Wins colors are only partially tiered — full color-code schema lives in M11.
+- No auto-arm fetch on game start — M10.
+- Chat target alert system for specific players — M12.
+- Cheater / client tags — M13 (Seraph API integration).
 
-**This is a real UX project in its own right — may warrant its own sub-plan when we get here.**
+**Verified 2026-04-21:** private Bedwars game with teams of one — table renders with rank prefixes intact, team colors preserved, order matches vanilla Hypixel tab stratification. Larger team sizes not yet tested in-game.
 
 ---
 
@@ -176,10 +187,69 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 
 **Deliverable:**
 - `%APPDATA%\Aurex\config.json` loaded on agent start, hot-reloaded on change (file watcher)
-- Settings: API key, enabled stat columns (stars, FKDR, W/L, wins, etc.), nick detection on/off, chat alerts on/off, table mode on/off
+- Settings: API key, enabled stat columns (stars, FKDR, W/L, wins, etc.), column order, nick detection on/off, chat alerts on/off
 - Graceful fallback if config is missing or malformed
 
 **Success check:** Edit config file → see changes in-game within a few seconds, no restart needed.
+
+---
+
+## M10 — Auto-fetch on game-start chat trigger
+
+**Goal:** Stats are already loaded by the time the match starts — no manual `AX-on` needed mid-queue.
+
+**Deliverable:**
+- Hook incoming chat packet (not just outgoing). Probably `NetHandlerPlayClient#handleChat` or inject on `GuiNewChat#printChatMessage`.
+- Pattern-match the raw line `"The game starts in 1 second!"` (and variants: `"in 2 seconds"`, etc.). Hypixel emits these from the lobby NPC/counter.
+- On match, schedule a one-shot `fetchArmed = true` for ~2s so every `NetworkPlayerInfo` currently in tab gets queued before the game actually starts.
+- Must not double-fire: dedup on (chat timestamp, line hash) or on arm-window-already-open.
+- Keep the manual `AX-on` path working too.
+
+**Success check:** Queue Bedwars, don't type anything — when the countdown ends, tab opens and every real player has cached stats (no `[...]` placeholders).
+
+---
+
+## M11 — Stat column coloring
+
+**Goal:** All data columns get color tiers, not just stars.
+
+**Deliverable:**
+- FKDR tiers (e.g. 0-1 gray, 1-3 white, 3-5 green, 5-10 blue, 10-20 purple, 20+ gold/red).
+- W/L tiers (similar ramp).
+- Wins tiers by magnitude (thresholds at 100 / 500 / 1k / 5k / 10k / 25k).
+- Stars: extend current tier palette to full 1000+ with the rainbow treatment deferred from M6.
+- Exact thresholds TBD; match community convention (Seraph / Polsu palettes as reference).
+
+**Success check:** Tab rows visibly read at a glance — a sweaty lobby pops red/gold, a casual one is gray/green.
+
+---
+
+## M12 — Chat target alert system
+
+**Goal:** Call out specific players (sweats, griefers, known cheaters) in chat the moment they show up in tab.
+
+**Deliverable:**
+- Target list stored in config (UUID or IGN). Probably a `targets.json` alongside `config.json`, editable with `AX-target add <name>` / `AX-target remove <name>` / `AX-target list` chat commands.
+- On tab-render, any NPI whose UUID/IGN is in the list fires a one-shot client chat line like `§c[AX] -> <name> is here (<reason>)§r`.
+- Dedup per UUID per lobby/game session (same pattern as M7 nick alerts — clear on `AX-off` and on game-start hook from M10).
+- Optional: tag row in the table (e.g. red row background or marker column).
+
+**Success check:** Add own alt to target list with reason "alt account" — queue with alt, see chat alert and row tag.
+
+---
+
+## M13 — Seraph API integration (cheater + client tags)
+
+**Goal:** Pull community-sourced cheater + client-detection data from the Seraph backend and surface it in tab.
+
+**Deliverable:**
+- HTTP client for the Seraph API (endpoints TBD — needs research; similar rate-limit/caching treatment to Hypixel).
+- For each player in tab, lookup: cheater flag + evidence, detected client (Lunar / Badlion / Feather / vanilla / suspicious).
+- Tab row gets an extra marker column or colored name/bg for flagged players.
+- Chat alert on first sight per session for cheater-flagged players, gated by the same fetch-arm logic as Hypixel stats.
+- Must degrade gracefully if the Seraph API is down — never block render, never crash.
+
+**Success check:** Queue against a known-flagged alt (or test UUID) — see cheater tag in tab and chat alert.
 
 ---
 

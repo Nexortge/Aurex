@@ -5,7 +5,11 @@ import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.FrameNode;
 import org.objectweb.asm.tree.InsnList;
+import org.objectweb.asm.tree.InsnNode;
+import org.objectweb.asm.tree.JumpInsnNode;
+import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.VarInsnNode;
@@ -49,6 +53,11 @@ final class TabOverlayTransformer implements ClassFileTransformer {
     private static final String HOOK_OWNER = "com/aurex/agent/Agent";
     private static final String ON_TAB_RENDER = "onTabRender";
     private static final String ON_TAB_RENDER_DESC = "()V";
+    // Agent.renderAurexTab(int) -> boolean. The bytecode consumes the width
+    // arg (ILOAD 1) and uses the return to branch: nonzero = we handled it,
+    // inject RETURN; zero = fall through to vanilla.
+    private static final String RENDER_AUREX_TAB = "renderAurexTab";
+    private static final String RENDER_AUREX_TAB_DESC = "(I)Z";
     private static final String DECORATE_NAME = "decorateName";
     // Takes (String, Object) — the Object is actually the NetworkPlayerInfo from
     // ALOAD 1. We declare it as Object, not NetworkPlayerInfo, because the Agent
@@ -84,9 +93,7 @@ final class TabOverlayTransformer implements ClassFileTransformer {
 
             for (MethodNode m : node.methods) {
                 if (RENDER_NAME.equals(m.name) && RENDER_DESC.equals(m.desc)) {
-                    m.instructions.insert(new MethodInsnNode(
-                            Opcodes.INVOKESTATIC, HOOK_OWNER, ON_TAB_RENDER,
-                            ON_TAB_RENDER_DESC, false));
+                    patchRenderPlayerlist(m);
                     patchedRender = true;
                 } else if (GET_NAME_NAME.equals(m.name) && GET_NAME_DESC.equals(m.desc)) {
                     patchedGetName = patchGetPlayerName(m);
@@ -112,6 +119,45 @@ final class TabOverlayTransformer implements ClassFileTransformer {
             Agent.log("TabOverlayTransformer: FAILED, leaving class untouched: " + t);
             return null;
         }
+    }
+
+    /**
+     * Inject the HEAD prologue of {@code renderPlayerlist}:
+     *
+     * <pre>
+     *   INVOKESTATIC Agent.onTabRender()V         // existing heartbeat log
+     *   ILOAD 1                                    // width arg
+     *   INVOKESTATIC Agent.renderAurexTab(I)Z
+     *   IFEQ skip                                  // 0 = fall through to vanilla
+     *   RETURN                                     // nonzero = we handled it
+     *   skip:
+     *     F_SAME                                   // stackmap frame required by verifier
+     *     [vanilla body continues here]
+     * </pre>
+     *
+     * <p>The {@link FrameNode} at {@code skip} is mandatory: Java 7+ bytecode
+     * requires a stackmap frame at every branch target, and {@code COMPUTE_MAXS}
+     * alone does not compute frames. {@code F_SAME} says "stack empty, locals
+     * unchanged from the method's start frame" — which matches what we have
+     * here because IFEQ popped the boolean we pushed.
+     *
+     * <p>See {@code memory/project_asm_branch_target_frames.md}.
+     */
+    private static void patchRenderPlayerlist(MethodNode m) {
+        LabelNode skip = new LabelNode();
+        InsnList head = new InsnList();
+        // heartbeat — runs every frame regardless of AX state.
+        head.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOK_OWNER,
+                ON_TAB_RENDER, ON_TAB_RENDER_DESC, false));
+        // conditional early-return gate
+        head.add(new VarInsnNode(Opcodes.ILOAD, 1));            // width
+        head.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOK_OWNER,
+                RENDER_AUREX_TAB, RENDER_AUREX_TAB_DESC, false));
+        head.add(new JumpInsnNode(Opcodes.IFEQ, skip));
+        head.add(new InsnNode(Opcodes.RETURN));
+        head.add(skip);
+        head.add(new FrameNode(Opcodes.F_SAME, 0, null, 0, null));
+        m.instructions.insert(head);
     }
 
     /**
