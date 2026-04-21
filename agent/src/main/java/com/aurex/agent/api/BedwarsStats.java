@@ -12,9 +12,10 @@ import java.util.UUID;
  * code can read it without synchronization.
  *
  * <p><b>Nicked / never-played players:</b> the parser returns {@code null} when
- * the response has no player object or no Bedwars stats. Callers should treat
- * {@code null} as "no data" and render accordingly (M7 will turn that into
- * {@code [NICK]}).
+ * the response has no player object or no Bedwars stats.
+ * {@link com.aurex.agent.AgentImpl#decorateInternal} treats {@code null} as
+ * nicked and renders the row with a red {@code [NICK]} tag plus a one-time
+ * chat alert.
  */
 public final class BedwarsStats {
 

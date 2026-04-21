@@ -6,8 +6,10 @@ import com.aurex.agent.api.HypixelClient;
 import com.aurex.agent.api.StatsCache;
 
 import java.lang.reflect.Method;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Bootstrap-only implementation of tab-name stats decoration.
@@ -51,11 +53,32 @@ public final class AgentImpl {
     /** Shown while a fetch is in flight. Trailing space so it butts up against the original name. */
     private static final String PLACEHOLDER = C_GRAY + "[...]" + RESET + " ";
 
+    /** Tag prepended to names that the API couldn't match (nicked / never played). */
+    private static final String NICK_PREFIX = C_DR + "[NICK]" + RESET + " ";
+
     /**
      * The singleton stats pipeline. {@code null} if no API key is configured —
      * in that case decoration is a no-op and Aurex runs silently.
      */
     private static final StatsCache statsCache = initStatsCache();
+
+    /**
+     * UUIDs we've already fired a "[AX] -> Name is nicked!" chat alert for.
+     * Cleared on {@code AX-off} so a re-arm in the same lobby re-announces.
+     *
+     * <p>Kept here (bootstrap) rather than on Agent because Agent has three
+     * loader copies and static state doesn't cross between them.
+     */
+    private static final Set<UUID> alertedNicks = ConcurrentHashMap.newKeySet();
+
+    /**
+     * First MC-loader we see an NPI through, cached for {@link Agent#sendClientChat}.
+     * Bootstrap classloader can't resolve {@code net.minecraft.*} on its own,
+     * so we snatch MC's loader off the first NetworkPlayerInfo that walks
+     * through {@code decorateInternal} and hand it to sendClientChat when we
+     * need to post an in-game line.
+     */
+    private static volatile ClassLoader capturedMcLoader;
 
     // Reflection cache for NetworkPlayerInfo#getGameProfile()#getId().
     // Can't compile-time reference net.minecraft.* from bootstrap — MC classes
@@ -92,8 +115,9 @@ public final class AgentImpl {
      *   <li>cache miss + fetch armed → kick off fetch, show {@code [...]}</li>
      *   <li>cache miss + fetch idle → original name (avoid phantom placeholders
      *       after the 3s arm window closes)</li>
-     *   <li>fetched but no Bedwars data (nicked / never played) → original
-     *       name (M7 will tag with {@code [NICK]})</li>
+     *   <li>fetched but no Bedwars data (nicked / never played) → prepend
+     *       {@code [NICK]} and fire a one-time {@code [AX] -> Name is nicked!}
+     *       chat alert (see {@link #handleNick})</li>
      * </ul>
      *
      * Must NEVER throw — on error we return the original name so tab still renders.
@@ -101,6 +125,9 @@ public final class AgentImpl {
     public static String decorateInternal(String originalName, Object networkPlayerInfo, boolean fetchArmed) {
         try {
             if (statsCache == null) return originalName;
+            if (capturedMcLoader == null && networkPlayerInfo != null) {
+                capturedMcLoader = networkPlayerInfo.getClass().getClassLoader();
+            }
             UUID uuid = extractUuid(networkPlayerInfo);
             if (uuid == null) return originalName;
 
@@ -114,11 +141,80 @@ public final class AgentImpl {
             if (fut.isCompletedExceptionally()) return originalName;
 
             BedwarsStats stats = fut.getNow(null);
-            if (stats == null) return originalName;    // nicked / never played — M7 handles
+            if (stats == null) return handleNick(uuid, originalName);
             return formatStatsPrefix(stats) + " " + originalName;
         } catch (Throwable t) {
             return originalName;
         }
+    }
+
+    /**
+     * Nicked / never-played branch. Called only when the fetch has completed
+     * and returned {@code null} (404 UUID, missing {@code player} object, or
+     * Bedwars stats absent).
+     *
+     * <p>Only decorates + alerts if {@code originalName} looks like it belongs
+     * to a real player row — Hypixel lobbies stuff NPCs and info rows into the
+     * tab, and tagging those as NICK would be visual noise and chat spam (see
+     * {@code memory/project_hypixel_tab_hazards.md}).
+     *
+     * <p>Chat alert fires once per UUID per arm/disarm cycle (see
+     * {@link #clearNickAlerts}). The red "[NICK]" tag in tab is stateless and
+     * persists as long as the cache entry does.
+     */
+    private static String handleNick(UUID uuid, String originalName) {
+        String alertName = extractAlertName(originalName);
+        if (alertName == null) return originalName;   // NPC / info row / weird formatting — leave alone
+
+        if (alertedNicks.add(uuid)) {
+            Agent.log("nick detected: " + alertName + " (" + shortUuid(uuid) + ")");
+            Agent.sendClientChat(C_DR + "[AX] -> " + alertName + " is nicked!" + RESET,
+                    capturedMcLoader);
+        }
+        return NICK_PREFIX + originalName;
+    }
+
+    /**
+     * Pull a plausible MC username out of {@code originalName}.
+     *
+     * <p>{@code getPlayerName} returns strings like {@code "§7[VIP] §fNotch"} on
+     * Hypixel — scoreboard team prefixes baked in. We strip section codes, take
+     * the last whitespace-separated token, and only return it if it matches the
+     * MC username shape ({@code [A-Za-z0-9_]{1,16}}). Anything else — rank-only
+     * rows, NPC display names with punctuation, "Waiting for players..." info
+     * rows — yields {@code null} and the caller skips decoration + alert.
+     */
+    private static String extractAlertName(String originalName) {
+        if (originalName == null) return null;
+        String stripped = originalName.replaceAll("§.", "").trim();
+        if (stripped.isEmpty()) return null;
+        int lastSpace = stripped.lastIndexOf(' ');
+        String candidate = lastSpace < 0 ? stripped : stripped.substring(lastSpace + 1);
+        if (candidate.isEmpty() || candidate.length() > 16) return null;
+        for (int i = 0; i < candidate.length(); i++) {
+            char c = candidate.charAt(i);
+            boolean valid = (c >= '0' && c <= '9')
+                    || (c >= 'a' && c <= 'z')
+                    || (c >= 'A' && c <= 'Z')
+                    || c == '_';
+            if (!valid) return null;
+        }
+        return candidate;
+    }
+
+    private static String shortUuid(UUID uuid) {
+        String s = uuid.toString().replace("-", "");
+        return s.substring(0, 8);
+    }
+
+    /**
+     * Drop the "we've already alerted for these UUIDs" set. Called from
+     * {@link Agent#disarm(boolean)} via reflection so the MC-loader copy of
+     * Agent can reach this bootstrap-resident state without a compile-time
+     * reference.
+     */
+    public static void clearNickAlerts() {
+        alertedNicks.clear();
     }
 
     /**

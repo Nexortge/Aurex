@@ -133,9 +133,16 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 
 ---
 
-## M7 — Nicked player detection + chat alert
+## M7 — Nicked player detection + chat alert — **Done (2026-04-21).**
 
 **Goal:** When a nicked player is detected (API returns no match or flagged nick), show `[NICK]` in tab and print `[AX] -> PlayerName is nicked!` client-side in chat.
+
+**What shipped in code:**
+- `AgentImpl.handleNick` — fires the nick branch of `decorateInternal` when the completed fetch yields `null` stats (HTTP 404 UUID, missing `player` object, or no Bedwars subtree).
+- Tab: `§4[NICK]§r ` (dark red) prepended to the row.
+- Chat: `§4[AX] -> <name> is nicked!§r` fired via `Agent.sendClientChat`. Dedup via a `ConcurrentHashMap.newKeySet()` keyed on UUID — at most one alert per UUID per arm/disarm cycle. `Agent.disarm` reflectively calls `AgentImpl.clearNickAlerts` on `AX-off` so a subsequent `AX-on` in the same lobby re-announces anyone still nicked.
+- NPC / info-row guard: `AgentImpl.extractAlertName` strips `§.` codes, takes the last whitespace-separated token, and only accepts strings matching the MC username shape (`[A-Za-z0-9_]{1,16}`). If it fails, we neither tag nor alert — prevents spam on Hypixel lobby NPCs and decorative info rows (cf. `memory/project_hypixel_tab_hazards.md`).
+- `Agent.sendClientChat(String, ClassLoader)` overload — the existing method used `Class.forName(name)`, which uses the caller's classloader; from bootstrap-Agent (where `AgentImpl` lives) that can't resolve `net.minecraft.*`. New overload takes an explicit loader; `AgentImpl` snatches one off the first `NetworkPlayerInfo` it sees and caches it for subsequent chat sends. Falls back to context classloader + `Agent.class.getClassLoader()` if null.
 
 **Deliverable:**
 - Detection: UUID lookup returns 404, OR Hypixel returns player with `null` stats object, OR player name matches a known nick pattern
@@ -143,6 +150,8 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 - Chat injection: client-side-only message (doesn't actually send to server), appears in chat log prefixed `[AX]`
 
 **Success check:** Queue with a friend using `/nick` — nick is flagged in tab and chat.
+
+**False-positive note:** Anyone who has never played Bedwars on their real account returns the same "no stats" shape as a nick. Plan explicitly folds this into the detection criteria; in practice on Hypixel the false-positive rate is low because most lobby/match participants have at least some Bedwars history. Tighter gating (e.g. pre-game UUID snapshot + Mojang lookup for modes that mask names) is post-M7 work.
 
 ---
 

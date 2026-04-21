@@ -269,9 +269,33 @@ public final class Agent {
         displayEnabled = false;
         fetchArmed = false;
         disarmAt = 0L;
+        clearNickAlerts();
         log("AX-off (display + fetch off)");
         if (announce) sendClientChat("\u00a7c[AX] off");
     }
+
+    /**
+     * Drain {@link AgentImpl}'s nick-alert dedup set so a subsequent AX-on
+     * re-announces any nicks that are still in the lobby. Reflective hop
+     * across the classloader split — same pattern as {@link #loadImpl()}.
+     * Never throws: alert-reset is best-effort and failing to clear just
+     * means the user sees each nick announced once per JVM, not per arm cycle.
+     */
+    private static void clearNickAlerts() {
+        try {
+            Method m = implClearNicksMethod;
+            if (m == null) {
+                m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                        .getMethod("clearNickAlerts");
+                implClearNicksMethod = m;
+            }
+            m.invoke(null);
+        } catch (Throwable t) {
+            log("clearNickAlerts failed: " + t);
+        }
+    }
+
+    private static volatile Method implClearNicksMethod;
 
     /**
      * Gate for rendering-side features (tab mutation, HUD, etc.). Persists
@@ -337,19 +361,36 @@ public final class Agent {
 
     /**
      * Print a client-side chat line (not sent to the server). Used for AX
-     * command confirmations.
+     * command confirmations and nick alerts.
      *
-     * Reflective because this code path ends up running in three classloader
-     * copies (app / bootstrap / MC); only the MC copy can see MC classes at
-     * compile time, but reflection works from any of them since
-     * {@link Class#forName(String)} uses the caller's classloader, which for
-     * the MC copy is Lunar's MC loader — where {@code net.minecraft.*} lives.
+     * <p>Reflective because this code path ends up running in three
+     * classloader copies (app / bootstrap / MC); only the MC copy can see
+     * {@code net.minecraft.*} via its own loader. Callers from bootstrap
+     * (e.g. {@link AgentImpl}) must pass an explicit MC-capable loader via
+     * {@link #sendClientChat(String, ClassLoader)} — bootstrap's own search
+     * won't resolve MC classes.
      *
-     * Package-private so {@link DisarmTask} can call it from the Timer thread.
+     * <p>Package-private so {@link DisarmTask} and {@link AgentImpl} can call it.
      */
     static void sendClientChat(String text) {
+        sendClientChat(text, null);
+    }
+
+    /**
+     * Same as {@link #sendClientChat(String)} but uses {@code mcLoader} to
+     * resolve {@code net.minecraft.*} classes. Falls back to a chain of
+     * candidate loaders if {@code null}, ending at this class's own loader.
+     *
+     * <p>Never throws — running on the render thread; a chat-send failure
+     * must not bring down the frame.
+     */
+    static void sendClientChat(String text, ClassLoader mcLoader) {
         try {
-            Class<?> mcClass = Class.forName("net.minecraft.client.Minecraft");
+            ClassLoader cl = mcLoader;
+            if (cl == null) cl = Thread.currentThread().getContextClassLoader();
+            if (cl == null) cl = Agent.class.getClassLoader();
+
+            Class<?> mcClass = Class.forName("net.minecraft.client.Minecraft", true, cl);
             Method getMinecraft = mcClass.getMethod("getMinecraft");
             Object mc = getMinecraft.invoke(null);
 
@@ -360,11 +401,11 @@ public final class Agent {
                 return;
             }
 
-            Class<?> componentClass = Class.forName("net.minecraft.util.ChatComponentText");
+            Class<?> componentClass = Class.forName("net.minecraft.util.ChatComponentText", true, cl);
             Object component = componentClass.getConstructor(String.class).newInstance(text);
 
-            Class<?> iChatComponent = Class.forName("net.minecraft.util.IChatComponent");
-            Class<?> entityPlayer = Class.forName("net.minecraft.entity.player.EntityPlayer");
+            Class<?> iChatComponent = Class.forName("net.minecraft.util.IChatComponent", true, cl);
+            Class<?> entityPlayer = Class.forName("net.minecraft.entity.player.EntityPlayer", true, cl);
             Method addChatMessage = entityPlayer.getMethod("addChatMessage", iChatComponent);
             addChatMessage.invoke(thePlayer, component);
         } catch (Throwable t) {
