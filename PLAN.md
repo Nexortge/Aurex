@@ -176,6 +176,8 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 - No auto-arm fetch on game start — M10.
 - Chat target alert system for specific players — M12.
 - Cheater / client tags — M13 (Seraph API integration).
+- **Health indicator missing.** Vanilla tab renders each player's hearts (scoreboard-health objective, the row of red hearts next to the name) inside `renderPlayerlist`. Our early-return skips it. Re-add as a dedicated column — read the same scoreboard objective vanilla uses (`GuiPlayerTabOverlay.drawScoreboardValues` / objective slot 0) and render it as either ascii hearts or an icon column. Placement TBD; user flagged as important, so handle before or during M11.
+- **Player head icon missing.** Vanilla tab draws each player's 8×8 face on the left of the row (skin texture, bound via `AbstractClientPlayer.getLocationSkin()` → `Minecraft.getTextureManager()`; vanilla uses `Gui.drawTexturedModalRect` with UV 8,8,8,8 for the face layer and 40,8,8,8 for the hat overlay). Early-return skips this too. **Tied to the Name cell, not its own column** — draw the face to the left of the name inside whatever x-slot the `name` column occupies, and offset the name string by ~10px to make room. This way reordering columns in config keeps the head next to the name (where the user expects it), and users who drop `name` from `columns` also drop the head. Needs GL state (`GlStateManager.color`, texture bind) and the skin-texture location from NPI. Handle alongside health in M11.
 
 **Verified 2026-04-21:** private Bedwars game with teams of one — table renders with rank prefixes intact, team colors preserved, order matches vanilla Hypixel tab stratification. Larger team sizes not yet tested in-game.
 
@@ -194,18 +196,19 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 
 ---
 
-## M10 — Auto-fetch on game-start chat trigger
+## M10 — Auto-fetch on game-start chat trigger — **Done (2026-04-22).**
 
 **Goal:** Stats are already loaded by the time the match starts — no manual `AX-on` needed mid-queue.
 
-**Deliverable:**
-- Hook incoming chat packet (not just outgoing). Probably `NetHandlerPlayClient#handleChat` or inject on `GuiNewChat#printChatMessage`.
-- Pattern-match the raw line `"The game starts in 1 second!"` (and variants: `"in 2 seconds"`, etc.). Hypixel emits these from the lobby NPC/counter.
-- On match, schedule a one-shot `fetchArmed = true` for ~2s so every `NetworkPlayerInfo` currently in tab gets queued before the game actually starts.
-- Must not double-fire: dedup on (chat timestamp, line hash) or on arm-window-already-open.
-- Keep the manual `AX-on` path working too.
+**What shipped:**
+- New `IncomingChatTransformer` targeting `net.minecraft.client.gui.GuiNewChat#printChatMessage(IChatComponent)V`. Injects `ALOAD 1; INVOKESTATIC Agent.onIncomingChat(Object)V` at HEAD. Void hook, no branches — no stackmap frame edits needed, unlike M3.5's `ChatCommandTransformer`. Picked `printChatMessage` over `NetHandlerPlayClient#handleChat` so the hook runs on the client main thread, not the netty IO thread.
+- `Agent.onIncomingChat(Object)` reflects `getUnformattedText()` off the component (parameter is Object so Agent still compiles MC-loader-safe), cheap-paths a `contains("starts in")` filter, then hand-matches `"The game starts in <N> second(s)!"` without regex (tight loop is cheaper than Pattern compile per chat line).
+- On match, calls `autoArm()` — sister to `arm()` but silent (no chat feedback) and shorter window (`AUTO_ARM_MS = 2000ms`). Flips BOTH `displayEnabled` and `fetchArmed`, not just fetch: if display were left off the tab renderer stays gated, which also gates fetch kick-off, so the feature would be a no-op. Auto-arming both mirrors the manual `AX-on` UX.
+- Dedup: 500ms timestamp guard (`AUTO_ARM_DEDUP_MS`). Countdown ticks fire ~1s apart so each real tick re-arms; duplicate echoes of the same line (within 500ms) don't double-fire. No per-line-content dedup — the DisarmTask generation-token pattern already handles multiple schedules correctly, and each real countdown tick legitimately extending the window is desired (keeps the fetch window open across 5→4→3→2→1 plus 2s into the match).
+- Manual `AX-on` path untouched. `arm()` still chats feedback + uses the 3s window.
+- **Eager pre-warm (both arm paths):** `arm()` and `autoArm()` now call `Agent.kickoffFetches()` immediately after flipping the gate flags. Reflects `Minecraft.getMinecraft().getNetHandler().getPlayerInfoMap()` (lives independent of TAB — the client mutates it on every `S38PacketPlayerListItem`, not just during render) → hands the NPI collection to new `AgentImpl.preWarmFetches`, which iterates, v4-filters NPCs, and calls `StatsCache.get(uuid)` for each. Previously the kick-off only fired inside the render path, so arming without holding TAB was a silent no-op; now the arm triggers a fetch burst up front and the first tab-render reads cached data instantly. Dedup is handled by `StatsCache`'s in-flight map, so the 5-tick countdown re-pre-warming on each tick is free.
 
-**Success check:** Queue Bedwars, don't type anything — when the countdown ends, tab opens and every real player has cached stats (no `[...]` placeholders).
+**Success check:** Queue Bedwars, don't type anything and don't touch TAB — when the countdown ends, press TAB once and every real player already has cached stats (no `[...]` placeholders).
 
 ---
 
@@ -250,6 +253,26 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 - Must degrade gracefully if the Seraph API is down — never block render, never crash.
 
 **Success check:** Queue against a known-flagged alt (or test UUID) — see cheater tag in tab and chat alert.
+
+---
+
+## M14 — API key rotation UX
+
+**Goal:** Make it painless for users on Hypixel's free developer-portal keys (which rotate and can get revoked) to recover without digging in config files.
+
+**Why:** Most users can't get a stable production key — they pull a temp key from `developer.hypixel.net` that gets invalidated periodically. Right now we detect startup-time misconfig in `Config` / the CLI test harness, but once Lunar is running a revoked key just produces silent 403s and empty stats with no clue why.
+
+**Deliverable:**
+- Detect auth failure in `HypixelClient` — HTTP 401/403 from `/v2/player`. On first occurrence per session, post a red chat line: `§c[AX] API key rejected. Get a new one at https://developer.hypixel.net and run AX-key <key>`. Dedup so it fires once per session, not per player lookup.
+- `AX-key <key>` chat command added to the existing `ChatCommandTransformer` / `Agent.onOutgoingChat` parser:
+  - Validates the argument is UUID-shaped (8-4-4-4-12 hex).
+  - Writes it to `%APPDATA%\Aurex\config.json` (merging, not clobbering — preserve columns / nickDetection / chatAlerts).
+  - **Hot-swap** the running `HypixelClient` / `StatsCache`. Currently M9 notes that apiKey mid-session changes can't take effect and we show a "restart Lunar to apply" warning — M14 makes them hot-swappable. Drop the cache too, since old 403s are stuck as failed futures.
+  - Confirm in chat: `§a[AX] API key updated. Retry a tab open.`
+  - **Security:** the command is swallowed client-side (same as AX-on etc.), so the key never goes to Hypixel chat. But it's still plaintext in the local log — scrub `AX-key` lines from the log write, or just don't log the command body at all.
+- Remove the M9 "restart Lunar to apply" warning once hot-swap works.
+
+**Success check:** Pull a working key, let it get rotated / revoke it manually in the dev portal, queue a game — see the red warning with link, run `AX-key <newkey>`, see confirmation, tab stats resume working without restarting Lunar.
 
 ---
 

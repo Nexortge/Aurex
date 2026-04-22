@@ -29,6 +29,7 @@ final class AgentPublisher {
     private static final String[] CLASSES = {
             "com.aurex.agent.Agent",
             "com.aurex.agent.DisarmTask",
+            "com.aurex.agent.AutoArmTask",
             "com.aurex.agent.TabRenderer"
     };
 

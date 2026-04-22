@@ -95,6 +95,8 @@ public final class Agent {
         preloadImpl();
         inst.addTransformer(new TabOverlayTransformer());
         inst.addTransformer(new ChatCommandTransformer());
+        inst.addTransformer(new JoinGameTransformer());
+        inst.addTransformer(new IncomingChatTransformer());
     }
 
     /**
@@ -243,6 +245,42 @@ public final class Agent {
     private static final long ARM_MS = 3000L;
 
     /**
+     * How long the game-start auto-arm keeps the fetch window open. Matches
+     * {@link #ARM_MS} (manual AX-on) for consistency. Starts ~2s after the
+     * final countdown tick — not at the countdown itself — so Hypixel's
+     * name-masking in the pre-game lobby doesn't pollute the fetch.
+     */
+    private static final long AUTO_ARM_MS = 3000L;
+
+    /**
+     * Delay between "countdown reaches 0" and the auto-arm actually firing.
+     * Hypixel masks player names during the pre-game lobby ("Player",
+     * "ClassAssignment", etc.) — fetching them at countdown time would just
+     * stash garbage. Waiting 2s past T=0 gives Bungee time to hand off to the
+     * match sub-server and for the client to receive the real roster via
+     * {@code S38PacketPlayerListItem}.
+     */
+    private static final long POST_START_DELAY_MS = 2000L;
+
+    /**
+     * Generation token for the pending {@link AutoArmTask}. Countdown ticks
+     * bump this at reschedule time; the scheduled task captures it, and
+     * no-ops at fire time if it's been superseded. Mirrors the {@code disarmAt}
+     * pattern {@link DisarmTask} uses.
+     */
+    static volatile long pendingAutoArmToken;
+
+    /**
+     * Minimum gap between consecutive auto-arms. Below this, duplicate chat
+     * packets (network echo, Hypixel's own replay, etc.) can't double-fire the
+     * arm. Above this, each real countdown tick (~1000ms apart) can re-arm.
+     */
+    private static final long AUTO_ARM_DEDUP_MS = 500L;
+
+    /** Wall-clock of the last auto-arm fire; used only for the dedup check. */
+    private static volatile long lastAutoArmMs;
+
+    /**
      * Called from the HEAD of {@code EntityPlayerSP#sendChatMessage(String)}.
      * Return {@code true} to swallow the outgoing packet (our commands), {@code
      * false} to let it go to the server (normal chat).
@@ -287,6 +325,112 @@ public final class Agent {
     }
 
     /**
+     * Called from the HEAD of {@code GuiNewChat#printChatMessage(IChatComponent)}
+     * via {@link IncomingChatTransformer}. Observes every chat line that reaches
+     * the client — pattern-matches Hypixel's countdown ("The game starts in N
+     * seconds!") and auto-arms the fetch window so stats are cached before the
+     * match begins.
+     *
+     * <p>Parameter is typed {@link Object} because {@link Agent} lives on the
+     * MC classloader and must not compile-time reference
+     * {@code net.minecraft.util.IChatComponent} (fine on MC loader but breaks
+     * the bootstrap + app copies of this class — they don't see MC classes).
+     * We reflect into {@code getUnformattedText()} at call time; any MC loader
+     * servicing the call can resolve it.
+     *
+     * <p>Must never throw: runs on the client main thread on every chat packet
+     * and for every {@code addChatMessage} call we ourselves make. An exception
+     * here would break the entire chat pipeline. On error we silently bail.
+     *
+     * <p>Cheap-path first: plain {@code String.contains} filter before regex,
+     * because 99.9% of chat lines aren't countdown lines and a failing regex on
+     * every chat packet would waste CPU.
+     */
+    public static void onIncomingChat(Object chatComponent) {
+        try {
+            if (chatComponent == null) return;
+            String text = extractChatText(chatComponent);
+            if (text == null) return;
+            int seconds = parseCountdownSeconds(text);
+            if (seconds < 0) return;
+
+            long now = System.currentTimeMillis();
+            if (now - lastAutoArmMs < AUTO_ARM_DEDUP_MS) return;
+            lastAutoArmMs = now;
+
+            // Formula: delay = N*1000ms (time until countdown ends) +
+            // POST_START_DELAY_MS (lag settle / Bungee handoff). Every tick
+            // converges on the same wall-clock target — the generation-token
+            // dance in AutoArmTask ensures only the latest fires.
+            long delay = (long) seconds * 1000L + POST_START_DELAY_MS;
+            long token = System.nanoTime();
+            pendingAutoArmToken = token;
+            timer.schedule(new AutoArmTask(token), delay);
+            log("auto-arm scheduled: +" + delay + "ms (countdown " + seconds + "s) on: \"" + text + "\"");
+        } catch (Throwable t) {
+            // Deliberately no log — a broken chat pipeline log-spamming once
+            // per message would fill the log fast. If this breaks, manual
+            // AX-on still works.
+        }
+    }
+
+    /**
+     * Reflectively pull the unformatted text out of an {@code IChatComponent}.
+     * We use {@code getUnformattedText()} (strips color/formatting) so the
+     * regex doesn't have to deal with §-codes Hypixel may or may not inject.
+     *
+     * <p>Resolves the class via the component's own loader so we don't care
+     * which classloader the caller handed us.
+     */
+    private static String extractChatText(Object chatComponent) {
+        try {
+            Method m = chatComponent.getClass().getMethod("getUnformattedText");
+            Object result = m.invoke(chatComponent);
+            return result == null ? null : result.toString();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Parse Hypixel's Bedwars pre-game countdown line and return the number of
+     * seconds remaining. Returns {@code -1} on no match.
+     *
+     * <p>Examples:
+     * <ul>
+     *   <li>{@code "The game starts in 5 seconds!"} → {@code 5}</li>
+     *   <li>{@code "The game starts in 1 second!"}  → {@code 1}</li>
+     * </ul>
+     *
+     * <p>Done manually to avoid Pattern compilation per call — this runs on
+     * every chat line so a tight loop over a short string is cheaper than
+     * regex setup.
+     */
+    private static int parseCountdownSeconds(String text) {
+        // Cheap-path: most chat lines don't contain "starts in".
+        if (text.length() < 24 || text.indexOf("starts in") < 0) return -1;
+        String s = text.trim();
+        if (!s.startsWith("The game starts in ")) return -1;
+        if (!s.endsWith("!")) return -1;
+        // What's between "The game starts in " and "!" should be "N second(s)".
+        String middle = s.substring(19, s.length() - 1).trim();
+        int spaceIdx = middle.indexOf(' ');
+        if (spaceIdx < 0) return -1;
+        String numPart = middle.substring(0, spaceIdx);
+        String unitPart = middle.substring(spaceIdx + 1);
+        if (!unitPart.equals("second") && !unitPart.equals("seconds")) return -1;
+        if (numPart.isEmpty()) return -1;
+        int value = 0;
+        for (int i = 0; i < numPart.length(); i++) {
+            char c = numPart.charAt(i);
+            if (c < '0' || c > '9') return -1;
+            value = value * 10 + (c - '0');
+            if (value > 60) return -1;  // sanity cap
+        }
+        return value;
+    }
+
+    /**
      * Shape-match a message against the "possibly-an-AX-command" pattern:
      * {@code ^[aA][xX] ?[-_]}. If true, the caller swallows the message and
      * prints a client-side hint — the goal is to keep typos like {@code ax_on}
@@ -314,8 +458,91 @@ public final class Agent {
         // Timer.schedule(task, delay) — task.run() fires on the Timer's thread
         // after delay ms. DisarmTask checks disarmAt == fireAt before actually
         // disarming, so a later arm() simply invalidates this task.
-        timer.schedule(new DisarmTask(fireAt), ARM_MS);
+        timer.schedule(new DisarmTask(fireAt, true), ARM_MS);
+        kickoffFetches();
     }
+
+    /**
+     * Actually perform the auto-arm. Called from {@link AutoArmTask#run()} —
+     * not directly from {@link #onIncomingChat(Object)}, because incoming-chat
+     * only <i>schedules</i> the arm for ~2s after the game starts (see
+     * {@link #POST_START_DELAY_MS}).
+     *
+     * <p>Same as {@link #arm()} but silent (no chat confirmation) and uses
+     * {@link #AUTO_ARM_MS}. Flips {@link #displayEnabled} too, not just
+     * {@link #fetchArmed}: if display were left off, the tab renderer would
+     * stay gated off, which gates off the fetch kick-off path too. Auto-arming
+     * both mirrors the manual {@code AX-on} UX.
+     *
+     * <p>Package-private so {@link AutoArmTask} can reach it.
+     */
+    static void autoArmNow() {
+        long fireAt = System.currentTimeMillis() + AUTO_ARM_MS;
+        disarmAt = fireAt;
+        displayEnabled = true;
+        fetchArmed = true;
+        timer.schedule(new DisarmTask(fireAt, false), AUTO_ARM_MS);
+        kickoffFetches();
+        log("auto-arm fired (window " + AUTO_ARM_MS + "ms)");
+    }
+
+    /**
+     * Eagerly pre-warm {@code StatsCache} for every player currently in the
+     * client's player-info map. Called from {@link #arm()} and {@link #autoArm()}
+     * so fetches fire immediately on arm, regardless of whether the user is
+     * holding TAB.
+     *
+     * <p>Before this was added, fetch kick-off only happened inside
+     * {@code AgentImpl.getTabData}, which only runs from {@code TabRenderer.render},
+     * which only runs while {@code renderPlayerlist} is rendering — i.e., while
+     * the user holds TAB. Arming without holding TAB during the window was a
+     * silent no-op. Now: the arm triggers a fetch burst up front; once responses
+     * land in cache, the first tab-render reads them instantly.
+     *
+     * <p>{@code NetHandlerPlayClient.playerInfoMap} is kept live by the client
+     * independently of tab-render — the server pushes
+     * {@code S38PacketPlayerListItem} updates as players join/leave/change, and
+     * the handler mutates the map on the netty→main thread boundary. Reading
+     * the map from the main thread (our call site) is safe.
+     *
+     * <p>Reflective path: {@code Minecraft.getMinecraft().getNetHandler()
+     * .getPlayerInfoMap()} returns {@code Collection<NetworkPlayerInfo>}. We
+     * convert to {@code Object[]} and hand off to bootstrap's {@code AgentImpl}
+     * which already owns the v4-UUID filter + StatsCache kickoff pattern.
+     *
+     * <p>Silent no-op if {@code netHandler} is null (user at main menu / not
+     * connected yet). Never throws — arm must not be able to crash the client.
+     */
+    private static void kickoffFetches() {
+        try {
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            if (cl == null) cl = Agent.class.getClassLoader();
+
+            Class<?> mcClass = Class.forName("net.minecraft.client.Minecraft", true, cl);
+            Object mc = mcClass.getMethod("getMinecraft").invoke(null);
+            Object netHandler = mcClass.getMethod("getNetHandler").invoke(mc);
+            if (netHandler == null) return;  // not in a world yet
+
+            Object infos = netHandler.getClass().getMethod("getPlayerInfoMap").invoke(netHandler);
+            if (!(infos instanceof java.util.Collection)) return;
+            java.util.Collection<?> coll = (java.util.Collection<?>) infos;
+            if (coll.isEmpty()) return;
+
+            Object[] npis = coll.toArray();
+
+            Method m = implPreWarmMethod;
+            if (m == null) {
+                m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                        .getMethod("preWarmFetches", Object[].class);
+                implPreWarmMethod = m;
+            }
+            m.invoke(null, (Object) npis);
+        } catch (Throwable t) {
+            log("kickoffFetches failed: " + t);
+        }
+    }
+
+    private static volatile Method implPreWarmMethod;
 
     private static void disarm(boolean announce) {
         displayEnabled = false;
@@ -412,39 +639,83 @@ public final class Agent {
     }
 
     /**
-     * Reflective hop to {@code AgentImpl.getTableRows}. Called by
+     * Reflective hop to {@code AgentImpl.getTabData}. Called by
      * {@link TabRenderer} once per tab frame (while AX-on) to get the
-     * preformatted row data. Same classloader bridge pattern as
-     * {@link #decorateName(String, Object)}.
+     * preformatted row data, the header array, and column IDs. Same
+     * classloader bridge pattern as {@link #decorateName(String, Object)}.
      *
-     * <p>Returns {@code null} on any failure so the caller can fall back to
-     * vanilla — never throws.
+     * <p>{@code scoreboard} + {@code objective} are the MC objects from the
+     * tab display slot — plumbed through so AgentImpl can read the health
+     * column. Either may be {@code null} if the server hasn't set one.
+     *
+     * <p>Returns {@code Object[3] = {String[] colIds, String[] headers,
+     * List<Object[]> rowEntries}} where each rowEntry is {@code {Object npi,
+     * String[] cells}}. Returns {@code null} on any failure so the caller
+     * can fall back to vanilla — never throws.
      */
-    @SuppressWarnings("unchecked")
-    public static java.util.List<String[]> getTableRows(Object[] npis) {
+    public static Object[] getTabData(Object[] npis, Object scoreboard, Object objective) {
         try {
-            Method m = implGetTableRowsMethod;
-            if (m == null) m = loadGetTableRows();
+            Method m = implGetTabDataMethod;
+            if (m == null) m = loadGetTabData();
             if (m == null) return null;
-            return (java.util.List<String[]>) m.invoke(null, npis, fetchArmed);
+            return (Object[]) m.invoke(null, npis, scoreboard, objective, fetchArmed);
         } catch (Throwable t) {
             return null;
         }
     }
 
-    private static volatile Method implGetTableRowsMethod;
+    private static volatile Method implGetTabDataMethod;
 
-    private static Method loadGetTableRows() {
+    private static Method loadGetTabData() {
         try {
             Method m = Class.forName("com.aurex.agent.AgentImpl", true, null)
-                    .getMethod("getTableRows", Object[].class, boolean.class);
-            implGetTableRowsMethod = m;
+                    .getMethod("getTabData", Object[].class, Object.class, Object.class, boolean.class);
+            implGetTabDataMethod = m;
             return m;
         } catch (Throwable t) {
-            log("AgentImpl.getTableRows lookup failed: " + t);
+            log("AgentImpl.getTabData lookup failed: " + t);
             return null;
         }
     }
+
+    /**
+     * Called from RETURN sites of {@code NetHandlerPlayClient#handleJoinGame}
+     * via {@link JoinGameTransformer}. Injected at RETURN (not HEAD) because
+     * the method is what creates {@code mc.thePlayer} — the chat send path
+     * needs thePlayer non-null.
+     *
+     * <p>Debounced at 500ms because BungeeCord-backed servers (Hypixel) fire
+     * handleJoinGame multiple times on connect as the proxy hands the client
+     * off to a sub-server. One announcement per real join is the UX we want.
+     *
+     * <p>Reloads config from disk and announces the result in chat. Reflective
+     * hop to bootstrap-resident state. Never throws — world join must not be
+     * blocked by Aurex.
+     */
+    public static void onServerJoin() {
+        try {
+            long now = System.currentTimeMillis();
+            if (now - lastJoinFireMs < JOIN_DEBOUNCE_MS) {
+                return;
+            }
+            lastJoinFireMs = now;
+
+            Method m = implOnServerJoinMethod;
+            if (m == null) {
+                m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                        .getMethod("onServerJoin");
+                implOnServerJoinMethod = m;
+            }
+            m.invoke(null);
+        } catch (Throwable t) {
+            log("onServerJoin bridge failed: " + t);
+        }
+    }
+
+    private static volatile Method implOnServerJoinMethod;
+    private static volatile long lastJoinFireMs;
+    /** Window for collapsing Bungee proxy→sub-server double-fires. */
+    private static final long JOIN_DEBOUNCE_MS = 500L;
 
     /**
      * Print a client-side chat line (not sent to the server). Used for AX

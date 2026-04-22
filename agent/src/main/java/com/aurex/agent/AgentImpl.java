@@ -1,7 +1,7 @@
 package com.aurex.agent;
 
-import com.aurex.agent.api.ApiKeyConfig;
 import com.aurex.agent.api.BedwarsStats;
+import com.aurex.agent.api.Config;
 import com.aurex.agent.api.HypixelClient;
 import com.aurex.agent.api.StatsCache;
 
@@ -63,6 +63,21 @@ public final class AgentImpl {
     private static final String NICK_PREFIX = C_DR + "[NICK]" + RESET + " ";
 
     /**
+     * Current config snapshot. Replaced atomically by {@link #onServerJoin()}.
+     * Render-thread code reads this into a local and treats it as immutable for
+     * the duration of one row / frame — never holds a reference across blocking
+     * boundaries.
+     */
+    private static volatile Config config = Config.load();
+
+    /**
+     * Initial API key at startup. Used by {@link #onServerJoin()} to detect
+     * when the user has changed {@code apiKey} mid-session — we can't swap
+     * out the running {@link HypixelClient}, so we warn and tell them to restart.
+     */
+    private static final String initialApiKey = config.apiKey;
+
+    /**
      * The singleton stats pipeline. {@code null} if no API key is configured —
      * in that case decoration is a no-op and Aurex runs silently.
      */
@@ -111,15 +126,15 @@ public final class AgentImpl {
     private static volatile Class<?> spTeamClass;
     private static volatile Class<?> teamInterfaceClass;
 
-    // --- M8 row-build column schema ----------------------------------------
-    // Each row returned by getTableRows is a String[5], pre-formatted with
-    // §-codes. Index constants keep the contract readable on both sides.
-    public static final int COL_STARS = 0;
-    public static final int COL_NAME  = 1;
-    public static final int COL_FKDR  = 2;
-    public static final int COL_WL    = 3;
-    public static final int COL_WINS  = 4;
-    public static final int COL_COUNT = 5;
+    // Scoreboard-objective reflection cache (health column). Vanilla's tab
+    // renders hearts from the objective in display slot 0; we pull the same
+    // value and show it as a number.
+    private static volatile Method scoreboardGetValueFromObjective;
+    private static volatile Method scoreGetScorePoints;
+
+    // --- M9 column schema --------------------------------------------------
+    // Column identifiers match Config.COL_* constants. Header + cell formatters
+    // live together in column() below — adding a new column is one case branch.
 
     /** Cell shown when stats are not yet known (armed + fetching, or fetch idle). */
     private static final String CELL_PLACEHOLDER = C_GRAY + "[...]" + RESET;
@@ -130,16 +145,67 @@ public final class AgentImpl {
 
     private static StatsCache initStatsCache() {
         try {
-            String key = ApiKeyConfig.load();
+            for (String issue : config.issues) {
+                Agent.log("config: " + issue);
+            }
+            String key = config.apiKey;
             if (key == null) {
                 Agent.log("stats: no API key (HYPIXEL_API_KEY env or %APPDATA%\\Aurex\\config.json); running without stats");
                 return null;
             }
-            Agent.log("stats: API key loaded; pipeline ready");
+            Agent.log("stats: API key loaded; pipeline ready (columns=" + config.columns
+                    + " nicks=" + config.nickDetection + " alerts=" + config.chatAlerts + ")");
             return new StatsCache(new HypixelClient(key, Agent::log));
         } catch (Throwable t) {
             Agent.log("stats: init failed, running without stats: " + t);
             return null;
+        }
+    }
+
+    /**
+     * Fires on every server/world join (hooked via {@link com.aurex.agent.JoinGameTransformer}).
+     * Reloads {@link #config} from disk. This is the only reload path — no
+     * polling, no file watcher.
+     *
+     * <p><b>Chat policy:</b> silent on success. Only posts in-game when
+     * something needs user attention — parse issues (unknown columns etc.) or
+     * an apiKey change that needs a restart. Successful reloads go to the log
+     * only. Rationale: Hypixel Bungee fires handleJoinGame on every
+     * lobby/sub-server hop; a success line per hop would be spam, but a warning
+     * per hop while the user fixes their config is actually useful.
+     *
+     * <p>API key changes can't take effect mid-session (the {@link HypixelClient}
+     * + {@link StatsCache} are bound to the startup key), so we detect and
+     * warn if {@code apiKey} differs from startup.
+     *
+     * <p>Never throws — runs off the render thread but still safety-wrapped so
+     * a malformed config can't break world-load.
+     */
+    public static void onServerJoin() {
+        try {
+            Config fresh = Config.load();
+            config = fresh;
+
+            Agent.log("config reloaded (" + fresh.columns.size() + " cols"
+                    + ", nicks=" + fresh.nickDetection
+                    + ", alerts=" + fresh.chatAlerts
+                    + ", issues=" + fresh.issues.size() + ")");
+
+            for (String issue : fresh.issues) {
+                Agent.log("config: " + issue);
+                Agent.sendClientChat("§e[AX] config: " + issue, capturedMcLoader);
+            }
+
+            boolean keyChanged = initialApiKey == null
+                    ? fresh.apiKey != null
+                    : !initialApiKey.equals(fresh.apiKey);
+            if (keyChanged) {
+                Agent.sendClientChat("§c[AX] apiKey changed — restart Lunar to apply",
+                        capturedMcLoader);
+                Agent.log("config: apiKey changed since startup — restart required");
+            }
+        } catch (Throwable t) {
+            Agent.log("onServerJoin failed: " + t);
         }
     }
 
@@ -202,6 +268,9 @@ public final class AgentImpl {
      * persists as long as the cache entry does.
      */
     private static String handleNick(UUID uuid, String originalName) {
+        Config cfg = config;
+        if (!cfg.nickDetection) return originalName;
+
         // Real Mojang-minted player UUIDs are always v4 (random). Hypixel
         // assigns v2/v3 UUIDs to server-generated entities (lobby NPCs,
         // shopkeepers, Firework Frank, etc.) — filter those by version nibble.
@@ -223,8 +292,10 @@ public final class AgentImpl {
 
         if (alertedNicks.add(uuid)) {
             Agent.log("nick detected: name='" + alertName + "' uuid=" + uuid);
-            Agent.sendClientChat(C_DR + "[AX] -> " + alertName + " is nicked!" + RESET,
-                    capturedMcLoader);
+            if (cfg.chatAlerts) {
+                Agent.sendClientChat(C_DR + "[AX] -> " + alertName + " is nicked!" + RESET,
+                        capturedMcLoader);
+            }
         }
         return NICK_PREFIX + originalName;
     }
@@ -269,33 +340,83 @@ public final class AgentImpl {
     }
 
     /**
-     * Build one tab row per viable {@code NetworkPlayerInfo}. Called from
-     * {@link Agent#getTableRows(Object[])} via the standard bootstrap hop.
+     * Build header/column metadata + one row per viable {@code NetworkPlayerInfo}.
+     * Called from {@link Agent#getTabData(Object[], Object, Object)} via the
+     * standard bootstrap hop.
      *
-     * <p>Returns a list of {@link #COL_COUNT}-element {@code String[]} rows
-     * with §-color codes baked in. Contract:
-     * <pre>
-     *   [COL_STARS] "§e[123✫]"                star bracket with prestige color
-     *   [COL_NAME ] "§fNexort"                player name (with [NICK]/[...] tag baked if applicable)
-     *   [COL_FKDR ] "§c[7.42]" / "§7[...]"    FKDR with skill-tier color, or placeholder
-     *   [COL_WL   ] "§f2.10"  / "§7—"         W/L ratio or dash-unknown
-     *   [COL_WINS ] "§f1,234" / "§7—"         wins or dash-unknown
-     * </pre>
+     * <p><b>Return shape:</b> {@code Object[3] = {
+     *   String[] colIds,
+     *   String[] headers,
+     *   List<Object[]> rowEntries    // each entry = {Object npi, String[] cells}
+     * }}. All types are {@code java.*} so the MC loader can read them without
+     * resolving api.* or gson.*. {@code colIds} lets the renderer identify the
+     * Name column (to draw the head icon next to it) without string-matching
+     * the human header.
+     *
+     * <p>Column count + order is driven entirely by {@link Config#columns} —
+     * each row's {@code cells} array has one entry per column in matching order,
+     * §-codes already baked in.
+     *
+     * <p>{@code scoreboard} + {@code objective} are the MC objects from display
+     * slot 0 (tab list slot) — may be {@code null} if the server hasn't set
+     * either. Used for the {@code health} column.
      *
      * <p>Filters: non-v4 UUIDs (NPCs per
      * {@code memory/project_hypixel_tab_hazards.md}) and null names.
      *
-     * <p>Sort: real players by FKDR descending, then nicks (top), then
-     * unknown/loading (bottom). This mirrors Seraph's convention of showing
-     * the best players first while making missing-data rows obvious.
+     * <p>Sort: by scoreboard team first (groups team colors / rank tiers),
+     * then NICK → REAL by FKDR desc → PLACEHOLDER → UNKNOWN. Mirrors Seraph.
      *
      * <p>Side effect: for cache-miss + {@code fetchArmed}, kicks off the same
      * async fetch {@link #decorateInternal} did. Since M8 bypasses the vanilla
      * {@code getPlayerName} path, this is now the only place new fetches
      * originate from the render thread.
      */
-    public static List<String[]> getTableRows(Object[] npis, boolean fetchArmed) {
-        if (npis == null || statsCache == null) return Collections.emptyList();
+    /**
+     * Eager fetch pre-warm, decoupled from the render path. Called from
+     * {@link Agent#arm()} and {@link Agent#autoArm()} so stats start loading
+     * the moment the arm fires — no TAB hold required.
+     *
+     * <p>Same filters + side effects as the per-NPI branch of
+     * {@link #getTabData}: v4-UUID check (skip NPCs), {@link StatsCache#get}
+     * kickoff. Dedup is handled inside {@code StatsCache} — repeat calls for
+     * the same UUID while a fetch is in flight return the existing future, so
+     * calling this on every tick of a 5-second countdown is safe.
+     *
+     * <p>Returns silently on any failure — arm must never be able to crash the
+     * client. Only logs a single summary line per call so a full 100-player
+     * lobby doesn't produce 100 log entries.
+     */
+    public static void preWarmFetches(Object[] npis) {
+        if (npis == null || statsCache == null) return;
+        try {
+            int kicked = 0;
+            for (Object npi : npis) {
+                if (npi == null) continue;
+                if (capturedMcLoader == null) capturedMcLoader = npi.getClass().getClassLoader();
+                UUID uuid = extractUuid(npi);
+                if (uuid == null) continue;
+                if (uuid.version() != 4) continue;  // NPC filter (same as getTabData)
+                // StatsCache.get dedups in-flight requests AND serves cached
+                // results instantly — so this is a no-op for UUIDs we already
+                // have fresh data for, and a no-double-fire for UUIDs whose
+                // request started on a previous arm tick.
+                statsCache.get(uuid);
+                kicked++;
+            }
+            if (kicked > 0) Agent.log("preWarmFetches: kicked " + kicked + " fetch(es)");
+        } catch (Throwable t) {
+            Agent.log("preWarmFetches failed: " + t);
+        }
+    }
+
+    public static Object[] getTabData(Object[] npis, Object scoreboard, Object objective, boolean fetchArmed) {
+        Config cfg = config;
+        String[] colIds = cfg.columns.toArray(new String[0]);
+        String[] headers = buildHeaders(cfg.columns);
+        if (npis == null || statsCache == null) {
+            return new Object[] { colIds, headers, Collections.emptyList() };
+        }
         try {
             List<RawRow> raws = new ArrayList<RawRow>(npis.length);
             for (Object npi : npis) {
@@ -309,19 +430,74 @@ public final class AgentImpl {
                 String name = extractName(npi);
                 if (name == null) continue;
 
-                raws.add(buildRawRow(npi, uuid, name, fetchArmed));
+                int hp = extractHealth(name, scoreboard, objective);
+                raws.add(buildRawRow(npi, uuid, name, hp, fetchArmed, cfg));
             }
 
-            // Sort: NICK (has alertName, was 404/no-stats) on top, then REAL
-            // players by FKDR desc, then PLACEHOLDER/UNKNOWN at bottom.
             raws.sort(ROW_ORDER);
 
-            List<String[]> rows = new ArrayList<String[]>(raws.size());
-            for (RawRow r : raws) rows.add(formatRow(r));
-            return rows;
+            List<Object[]> rowEntries = new ArrayList<Object[]>(raws.size());
+            for (RawRow r : raws) {
+                rowEntries.add(new Object[] { r.npi, formatRow(r, cfg.columns) });
+            }
+            return new Object[] { colIds, headers, rowEntries };
         } catch (Throwable t) {
-            Agent.log("getTableRows failed: " + t);
-            return Collections.emptyList();
+            Agent.log("getTabData failed: " + t);
+            return new Object[] { colIds, headers, Collections.emptyList() };
+        }
+    }
+
+    /**
+     * Pull the player's tab-slot scoreboard value (hearts on Hypixel Bedwars).
+     * Returns {@code -1} if the server hasn't set a tab objective, or if this
+     * player isn't tracked by it.
+     *
+     * <p>Mirrors what {@code GuiPlayerTabOverlay.drawScoreboardValues} reads
+     * internally — we just interpret the score as a number instead of drawing
+     * hearts. Hypixel Bedwars sets the score to the player's current HP
+     * (0-20); pre-game lobbies leave the objective null, which we show as "—".
+     *
+     * <p>Reflection is mandatory — {@code Scoreboard} / {@code ScoreObjective}
+     * / {@code Score} all live on Lunar's MC loader, we're on bootstrap.
+     */
+    private static int extractHealth(String rawName, Object scoreboard, Object objective) {
+        if (scoreboard == null || objective == null || rawName == null) return -1;
+        try {
+            Method mGet = scoreboardGetValueFromObjective;
+            if (mGet == null) {
+                mGet = scoreboard.getClass().getMethod("getValueFromObjective",
+                        String.class, objective.getClass());
+                scoreboardGetValueFromObjective = mGet;
+            }
+            Object score = mGet.invoke(scoreboard, rawName, objective);
+            if (score == null) return -1;
+
+            Method mPts = scoreGetScorePoints;
+            if (mPts == null) {
+                mPts = score.getClass().getMethod("getScorePoints");
+                scoreGetScorePoints = mPts;
+            }
+            return (Integer) mPts.invoke(score);
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    private static String[] buildHeaders(List<String> cols) {
+        String[] h = new String[cols.size()];
+        for (int i = 0; i < cols.size(); i++) h[i] = headerFor(cols.get(i));
+        return h;
+    }
+
+    private static String headerFor(String col) {
+        switch (col) {
+            case Config.COL_STARS:  return "✫";
+            case Config.COL_NAME:   return "Name";
+            case Config.COL_FKDR:   return "FKDR";
+            case Config.COL_WL:     return "W/L";
+            case Config.COL_WINS:   return "Wins";
+            case Config.COL_HEALTH: return "HP";
+            default: return col;  // unreachable — Config filtered already
         }
     }
 
@@ -339,20 +515,25 @@ public final class AgentImpl {
      * rank-stratified tab list).
      */
     private static final class RawRow {
+        final Object npi;
         final UUID uuid;
         final String rawName;
         final String displayName;
         final String teamKey;
         final BedwarsStats stats;   // null unless REAL
         final RowStatus status;
-        RawRow(UUID uuid, String rawName, String displayName, String teamKey,
-               BedwarsStats stats, RowStatus status) {
+        final int health;           // 0-20 from scoreboard; -1 if untracked
+        RawRow(Object npi, UUID uuid, String rawName, String displayName, String teamKey,
+               BedwarsStats stats, RowStatus status, int health) {
+            this.npi = npi;
             this.uuid = uuid; this.rawName = rawName; this.displayName = displayName;
             this.teamKey = teamKey; this.stats = stats; this.status = status;
+            this.health = health;
         }
     }
 
-    private static RawRow buildRawRow(Object npi, UUID uuid, String rawName, boolean fetchArmed) {
+    private static RawRow buildRawRow(Object npi, UUID uuid, String rawName, int health,
+                                      boolean fetchArmed, Config cfg) {
         String display = extractDisplayName(npi, rawName);
         String teamKey = extractTeamKey(npi);
 
@@ -360,25 +541,32 @@ public final class AgentImpl {
         if (fut == null) {
             if (fetchArmed) {
                 statsCache.get(uuid);   // kick off async fetch
-                return new RawRow(uuid, rawName, display, teamKey, null, RowStatus.PLACEHOLDER);
+                return new RawRow(npi, uuid, rawName, display, teamKey, null, RowStatus.PLACEHOLDER, health);
             }
-            return new RawRow(uuid, rawName, display, teamKey, null, RowStatus.UNKNOWN);
+            return new RawRow(npi, uuid, rawName, display, teamKey, null, RowStatus.UNKNOWN, health);
         }
-        if (!fut.isDone()) return new RawRow(uuid, rawName, display, teamKey, null, RowStatus.PLACEHOLDER);
-        if (fut.isCompletedExceptionally()) return new RawRow(uuid, rawName, display, teamKey, null, RowStatus.UNKNOWN);
+        if (!fut.isDone()) return new RawRow(npi, uuid, rawName, display, teamKey, null, RowStatus.PLACEHOLDER, health);
+        if (fut.isCompletedExceptionally()) return new RawRow(npi, uuid, rawName, display, teamKey, null, RowStatus.UNKNOWN, health);
 
         BedwarsStats stats = fut.getNow(null);
         if (stats == null) {
-            // nick / never-played — same branch as decorateInternal.handleNick.
-            // Alert is deduped across M8 and M4 paths because alertedNicks is shared.
+            // Nick / never-played. If nick detection is off, present as UNKNOWN
+            // (no [NICK] tag, no alert). If on but chat alerts are off, tag the
+            // row but skip the chat line. Alert dedup is shared with the
+            // decorateInternal path via alertedNicks so we never double-fire.
+            if (!cfg.nickDetection) {
+                return new RawRow(npi, uuid, rawName, display, teamKey, null, RowStatus.UNKNOWN, health);
+            }
             if (alertedNicks.add(uuid)) {
                 Agent.log("nick detected (table): name='" + rawName + "' uuid=" + uuid);
-                Agent.sendClientChat(C_DR + "[AX] -> " + rawName + " is nicked!" + RESET,
-                        capturedMcLoader);
+                if (cfg.chatAlerts) {
+                    Agent.sendClientChat(C_DR + "[AX] -> " + rawName + " is nicked!" + RESET,
+                            capturedMcLoader);
+                }
             }
-            return new RawRow(uuid, rawName, display, teamKey, null, RowStatus.NICK);
+            return new RawRow(npi, uuid, rawName, display, teamKey, null, RowStatus.NICK, health);
         }
-        return new RawRow(uuid, rawName, display, teamKey, stats, RowStatus.REAL);
+        return new RawRow(npi, uuid, rawName, display, teamKey, stats, RowStatus.REAL, health);
     }
 
     /**
@@ -412,49 +600,73 @@ public final class AgentImpl {
         }
     };
 
-    private static String[] formatRow(RawRow r) {
-        String[] cells = new String[COL_COUNT];
-        // Name cell: use vanilla's formatted display name — rank prefix + team
-        // color already baked in. Don't wrap in our own color code; that would
-        // clobber the team color. RESET appended so later cells start clean.
+    /**
+     * Produce cells in config column order, §-codes baked in.
+     *
+     * <p>Name column uses the vanilla-formatted display name (rank prefix +
+     * team color already there); we append RESET so the next cell starts clean.
+     * All other cells branch on {@link RowStatus} — REAL gets live stat
+     * formatting, NICK/PLACEHOLDER/UNKNOWN get a single fallback glyph.
+     */
+    private static String[] formatRow(RawRow r, List<String> cols) {
+        String[] cells = new String[cols.size()];
+        for (int i = 0; i < cols.size(); i++) {
+            cells[i] = formatCell(cols.get(i), r);
+        }
+        return cells;
+    }
+
+    private static String formatCell(String col, RawRow r) {
         String nameCell = r.displayName + RESET;
+
+        // Health is independent of API status — a PLACEHOLDER row (stats still
+        // fetching) can still render HP as long as the scoreboard objective
+        // exists. Handle it before the status-switch.
+        if (col.equals(Config.COL_HEALTH)) return formatHealth(r.health);
+
         switch (r.status) {
             case REAL: {
                 BedwarsStats s = r.stats;
-                cells[COL_STARS] = starColor(s.stars) + "[" + s.stars + "✫]" + RESET;
-                cells[COL_NAME ] = nameCell;
-                cells[COL_FKDR ] = fkdrColor(s.fkdr) + "[" + String.format("%.2f", s.fkdr) + "]" + RESET;
-                cells[COL_WL   ] = C_WHITE + String.format("%.2f", s.wlr) + RESET;
-                cells[COL_WINS ] = C_WHITE + formatInt(s.wins) + RESET;
-                break;
+                switch (col) {
+                    case Config.COL_STARS: return starColor(s.stars) + "[" + s.stars + "✫]" + RESET;
+                    case Config.COL_NAME:  return nameCell;
+                    case Config.COL_FKDR:  return fkdrColor(s.fkdr) + "[" + String.format("%.2f", s.fkdr) + "]" + RESET;
+                    case Config.COL_WL:    return C_WHITE + String.format("%.2f", s.wlr) + RESET;
+                    case Config.COL_WINS:  return C_WHITE + formatInt(s.wins) + RESET;
+                    default: return CELL_UNKNOWN;
+                }
             }
-            case NICK: {
-                cells[COL_STARS] = C_DR + "[NICK]" + RESET;
-                cells[COL_NAME ] = nameCell;
-                cells[COL_FKDR ] = CELL_UNKNOWN;
-                cells[COL_WL   ] = CELL_UNKNOWN;
-                cells[COL_WINS ] = CELL_UNKNOWN;
-                break;
-            }
-            case PLACEHOLDER: {
-                cells[COL_STARS] = CELL_PLACEHOLDER;
-                cells[COL_NAME ] = nameCell;
-                cells[COL_FKDR ] = CELL_PLACEHOLDER;
-                cells[COL_WL   ] = CELL_PLACEHOLDER;
-                cells[COL_WINS ] = CELL_PLACEHOLDER;
-                break;
-            }
+            case NICK:
+                // [NICK] occupies the stars column by convention (leftmost
+                // stat slot); other stat cells show as dash-unknown. Name is
+                // always the rendered name regardless.
+                if (col.equals(Config.COL_NAME)) return nameCell;
+                if (col.equals(Config.COL_STARS)) return C_DR + "[NICK]" + RESET;
+                return CELL_UNKNOWN;
+            case PLACEHOLDER:
+                if (col.equals(Config.COL_NAME)) return nameCell;
+                return CELL_PLACEHOLDER;
             case UNKNOWN:
-            default: {
-                cells[COL_STARS] = CELL_UNKNOWN;
-                cells[COL_NAME ] = nameCell;
-                cells[COL_FKDR ] = CELL_UNKNOWN;
-                cells[COL_WL   ] = CELL_UNKNOWN;
-                cells[COL_WINS ] = CELL_UNKNOWN;
-                break;
-            }
+            default:
+                if (col.equals(Config.COL_NAME)) return nameCell;
+                return CELL_UNKNOWN;
         }
-        return cells;
+    }
+
+    /**
+     * HP cell: coloured 0-20 integer. The raw scoreboard score is the HP
+     * directly — Hypixel mirrors MC's vanilla health criterion, whole
+     * numbers only. Tiers: {@code <= 5} red, {@code <= 10} yellow,
+     * {@code > 10} green. Raw {@code -1} → unknown dash (objective not set,
+     * or player not tracked — typical in Hypixel lobbies).
+     */
+    private static String formatHealth(int hp) {
+        if (hp < 0) return CELL_UNKNOWN;
+        String color;
+        if (hp <= 5)      color = C_RED;
+        else if (hp <= 10) color = C_YELLOW;
+        else              color = C_DG;  // dark green — matches Bedwars palette
+        return color + hp + RESET;
     }
 
     /** 1234 → "1,234". Locale-agnostic, thousands separator only. */
@@ -624,7 +836,7 @@ public final class AgentImpl {
      * Standard Bedwars prestige palette. 0-99 stone, 100 iron, 200 gold,
      * 300 diamond, 400 emerald, 500 sapphire, 600 ruby, 700 crystal, 800 opal,
      * 900 amethyst, 1000+ rainbow (placeholder: solid gold — proper per-char
-     * rainbow is an M8 concern).
+     * rainbow is M11 work, tracked alongside FKDR/W/L/Wins coloring).
      */
     private static String starColor(int stars) {
         if (stars < 100)  return C_GRAY;

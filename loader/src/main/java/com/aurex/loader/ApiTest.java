@@ -1,7 +1,7 @@
 package com.aurex.loader;
 
-import com.aurex.agent.api.ApiKeyConfig;
 import com.aurex.agent.api.BedwarsStats;
+import com.aurex.agent.api.Config;
 import com.aurex.agent.api.HypixelClient;
 import com.aurex.agent.api.StatsCache;
 
@@ -37,23 +37,20 @@ final class ApiTest {
             return;
         }
 
-        String apiKey;
-        try {
-            apiKey = ApiKeyConfig.load();
-        } catch (Exception e) {
-            System.err.println("Could not read API key config: " + e.getMessage());
-            System.exit(3);
-            return;
+        Config cfg = Config.load();
+        for (String issue : cfg.issues) {
+            System.err.println("config: " + issue);
         }
+        String apiKey = cfg.apiKey;
 
         if (apiKey == null) {
-            Path cfg = ApiKeyConfig.resolveConfigPath();
+            Path cfgPath = Config.resolveConfigPath();
             System.err.println("No API key found.");
             System.err.println();
             System.err.println("Set one of:");
             System.err.println("  Environment variable:  HYPIXEL_API_KEY=<key>");
-            if (cfg != null) {
-                System.err.println("  Config file:           " + cfg);
+            if (cfgPath != null) {
+                System.err.println("  Config file:           " + cfgPath);
                 System.err.println("                         (JSON: {\"apiKey\": \"<key>\"})");
             }
             System.err.println();
