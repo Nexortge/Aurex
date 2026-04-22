@@ -46,7 +46,7 @@ final class DisarmTask extends TimerTask {
             Agent.fetchArmed = false;
             Agent.disarmAt = 0L;
             Agent.log("fetch window closed");
-            if (announce) Agent.sendClientChat("§e[AX] fetch window closed");
+            if (announce) Agent.sendClientChat(Agent.PREFIX + "§efetch window closed");
         } catch (Throwable t) {
             Agent.log("DisarmTask failed: " + t);
         }

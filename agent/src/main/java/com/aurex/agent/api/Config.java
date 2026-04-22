@@ -1,6 +1,7 @@
 package com.aurex.agent.api;
 
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -14,6 +15,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -70,7 +72,7 @@ public final class Config {
         VALID_COLUMNS = Collections.unmodifiableSet(valid);
 
         LinkedHashSet<String> keys = new LinkedHashSet<String>(Arrays.asList(
-                "apiKey", "activeMode", "nickDetection", "chatAlerts"));
+                "apiKey", "activeMode", "nickDetection", "chatAlerts", "ignoreList"));
         RECOGNIZED_KEYS = Collections.unmodifiableSet(keys);
     }
 
@@ -97,7 +99,17 @@ public final class Config {
     public final String activeMode;
     public final boolean nickDetection;
     public final boolean chatAlerts;
-    /** The loaded mode config — source of columns + colors. Never null. */
+    /**
+     * Lowercased usernames excluded from the M14 threat report. Typically the
+     * user's own alts. Populated via {@code AX-ignore}/{@code AX-removeignore}.
+     * Empty set when unset — never null. Comparison is case-insensitive via the
+     * stored strings being pre-lowered.
+     *
+     * <p>Lives in the global config (not per-mode) because an alt list is
+     * identity-scoped — you're the same person in Bedwars and SkyWars.
+     */
+    public final Set<String> ignoreList;
+    /** The loaded mode config — source of columns + colors + alert thresholds. Never null. */
     public final ModeConfig modeConfig;
     /** Non-fatal parse issues from BOTH files. Flushed to chat on server-join. */
     public final List<String> issues;
@@ -106,19 +118,27 @@ public final class Config {
     public final List<String> columns;
     public final Map<String, List<ColorTier>> colors;
     public final Map<String, String> headers;
+    /** Passthrough from {@link #modeConfig} — FKDR threat threshold for the active mode. */
+    public final double fkdrThreshold;
+    /** Passthrough from {@link #modeConfig} — stars threat threshold for the active mode. */
+    public final int starsThreshold;
 
     private Config(String apiKey, String activeMode,
                    boolean nickDetection, boolean chatAlerts,
+                   Set<String> ignoreList,
                    ModeConfig modeConfig, List<String> issues) {
         this.apiKey = apiKey;
         this.activeMode = activeMode;
         this.nickDetection = nickDetection;
         this.chatAlerts = chatAlerts;
+        this.ignoreList = ignoreList;
         this.modeConfig = modeConfig;
         this.issues = issues;
         this.columns = modeConfig.columns;
         this.colors = modeConfig.colors;
         this.headers = modeConfig.headers;
+        this.fkdrThreshold = modeConfig.fkdrThreshold;
+        this.starsThreshold = modeConfig.starsThreshold;
     }
 
     /**
@@ -136,6 +156,7 @@ public final class Config {
         String activeMode = DEFAULT_MODE;
         boolean nickDetection = true;
         boolean chatAlerts = true;
+        Set<String> ignoreList = Collections.emptySet();
 
         if (root != null) {
             if (apiKey == null) apiKey = readString(root, "apiKey", issues);
@@ -150,6 +171,21 @@ public final class Config {
             }
             nickDetection = readBool(root, "nickDetection", true, issues);
             chatAlerts = readBool(root, "chatAlerts", true, issues);
+            ignoreList = readIgnoreList(root, issues);
+
+            // Pre-refactor `alerts` block lived at the global level. We now store
+            // thresholds per-mode — if we see a legacy global block, copy its
+            // values into the active-mode file and strip from global so it isn't
+            // reported as "unknown key" on every join. In-memory remove first so
+            // the loop below doesn't flag it either.
+            if (root.has("alerts")) {
+                JsonElement ae = root.get("alerts");
+                if (ae.isJsonObject()) {
+                    migrateLegacyAlerts(activeMode, ae.getAsJsonObject(), issues);
+                }
+                root.remove("alerts");
+                stripLegacyAlertsFromFile();
+            }
 
             for (String key : root.keySet()) {
                 if (!RECOGNIZED_KEYS.contains(key)) {
@@ -161,7 +197,7 @@ public final class Config {
         ModeConfig modeConfig = ModeConfig.load(activeMode, issues);
 
         return new Config(apiKey, activeMode, nickDetection, chatAlerts,
-                modeConfig, Collections.unmodifiableList(issues));
+                ignoreList, modeConfig, Collections.unmodifiableList(issues));
     }
 
     /**
@@ -235,6 +271,7 @@ public final class Config {
         o.addProperty("activeMode", DEFAULT_MODE);
         o.addProperty("nickDetection", true);
         o.addProperty("chatAlerts", true);
+        o.add("ignoreList", new JsonArray());
         return o;
     }
 
@@ -257,5 +294,186 @@ public final class Config {
             return defaultValue;
         }
         return el.getAsBoolean();
+    }
+
+    /**
+     * Parse {@code ignoreList} array. Entries are normalized to lowercase so
+     * comparisons against raw MC usernames are case-insensitive. Non-string or
+     * empty entries are dropped with a parse issue.
+     */
+    private static Set<String> readIgnoreList(JsonObject root, List<String> issues) {
+        if (!root.has("ignoreList") || root.get("ignoreList").isJsonNull()) {
+            return Collections.emptySet();
+        }
+        JsonElement el = root.get("ignoreList");
+        if (!el.isJsonArray()) {
+            issues.add("ignoreList must be an array — ignored");
+            return Collections.emptySet();
+        }
+        JsonArray arr = el.getAsJsonArray();
+        LinkedHashSet<String> out = new LinkedHashSet<String>();
+        for (int i = 0; i < arr.size(); i++) {
+            JsonElement item = arr.get(i);
+            if (item == null || item.isJsonNull()) continue;
+            if (!item.isJsonPrimitive() || !item.getAsJsonPrimitive().isString()) {
+                issues.add("ignoreList[" + i + "] not a string — skipped");
+                continue;
+            }
+            String s = item.getAsString().trim().toLowerCase();
+            if (!s.isEmpty()) out.add(s);
+        }
+        return Collections.unmodifiableSet(out);
+    }
+
+    /**
+     * Add {@code name} to the {@code ignoreList} array in {@code config.json}
+     * (lowercased; duplicates are no-ops). Called from the {@code AX-ignore}
+     * chat command. Creates the file if missing, preserves all other fields.
+     *
+     * <p>Returns {@code true} on success; {@code false} on I/O or parse failure
+     * (caller surfaces the error in chat).
+     */
+    public static boolean writeIgnoreListAdd(String name) {
+        if (name == null) return false;
+        String normalized = name.trim().toLowerCase();
+        if (normalized.isEmpty()) return false;
+        return mutateIgnoreList(normalized, true);
+    }
+
+    /**
+     * Remove {@code name} from the {@code ignoreList} array in {@code config.json}
+     * (case-insensitive). Called from the {@code AX-removeignore} chat command.
+     *
+     * <p>Returns {@code true} on success; {@code false} on I/O or parse failure.
+     */
+    public static boolean writeIgnoreListRemove(String name) {
+        if (name == null) return false;
+        String normalized = name.trim().toLowerCase();
+        if (normalized.isEmpty()) return false;
+        return mutateIgnoreList(normalized, false);
+    }
+
+    /**
+     * Copy a legacy global {@code alerts} block into the per-mode file for
+     * {@code activeMode}. Only injects keys the mode file doesn't already have —
+     * user's own edits in the mode file win. Runs before {@link ModeConfig#load}
+     * so the mode file is in its final shape when ModeConfig parses it.
+     *
+     * <p>One-time migration; once {@code alerts} is stripped from global, this
+     * is never invoked again.
+     */
+    private static void migrateLegacyAlerts(String activeMode, JsonObject legacy, List<String> issues) {
+        try {
+            Path modePath = ModeConfig.resolveModePath(activeMode);
+            if (modePath == null) return;
+
+            JsonObject modeRoot = null;
+            if (Files.exists(modePath)) {
+                try (Reader r = Files.newBufferedReader(modePath, StandardCharsets.UTF_8)) {
+                    JsonElement el = JsonParser.parseReader(r);
+                    if (el != null && el.isJsonObject()) modeRoot = el.getAsJsonObject();
+                }
+            }
+            if (modeRoot == null) modeRoot = ModeConfig.buildDefaultJson(activeMode);
+
+            JsonObject alerts;
+            if (modeRoot.has("alerts") && modeRoot.get("alerts").isJsonObject()) {
+                alerts = modeRoot.getAsJsonObject("alerts");
+            } else {
+                alerts = new JsonObject();
+                modeRoot.add("alerts", alerts);
+            }
+            if (legacy.has("fkdrThreshold") && !alerts.has("fkdrThreshold")) {
+                alerts.add("fkdrThreshold", legacy.get("fkdrThreshold"));
+            }
+            if (legacy.has("starsThreshold") && !alerts.has("starsThreshold")) {
+                alerts.add("starsThreshold", legacy.get("starsThreshold"));
+            }
+
+            if (modePath.getParent() != null) Files.createDirectories(modePath.getParent());
+            String pretty = new GsonBuilder().setPrettyPrinting().create().toJson(modeRoot);
+            Files.write(modePath, pretty.getBytes(StandardCharsets.UTF_8));
+            issues.add("migrated legacy `alerts` from config.json → modes/" + activeMode + ".json");
+        } catch (Exception e) {
+            issues.add("could not migrate legacy alerts: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Rewrite {@code config.json} without the legacy {@code alerts} block.
+     * Best-effort: a failure here just means the user keeps seeing the migration
+     * note on next launch — not destructive.
+     */
+    private static void stripLegacyAlertsFromFile() {
+        Path path = resolveConfigPath();
+        if (path == null) return;
+        try {
+            if (!Files.exists(path)) return;
+            JsonObject root;
+            try (Reader r = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+                JsonElement el = JsonParser.parseReader(r);
+                if (el == null || !el.isJsonObject()) return;
+                root = el.getAsJsonObject();
+            }
+            if (!root.has("alerts")) return;
+            root.remove("alerts");
+            String pretty = new GsonBuilder().setPrettyPrinting().create().toJson(root);
+            Files.write(path, pretty.getBytes(StandardCharsets.UTF_8));
+        } catch (Exception ignored) {
+            // migration is best-effort; user sees next attempt or can delete manually
+        }
+    }
+
+    private static boolean mutateIgnoreList(String lowered, boolean add) {
+        Path path = resolveConfigPath();
+        if (path == null) return false;
+        try {
+            if (path.getParent() != null) Files.createDirectories(path.getParent());
+            JsonObject root = null;
+            if (Files.exists(path)) {
+                try (Reader r = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+                    JsonElement el = JsonParser.parseReader(r);
+                    if (el != null && el.isJsonObject()) root = el.getAsJsonObject();
+                }
+            }
+            if (root == null) root = buildDefaultGlobalJson();
+
+            JsonArray arr;
+            if (root.has("ignoreList") && root.get("ignoreList").isJsonArray()) {
+                arr = root.getAsJsonArray("ignoreList");
+            } else {
+                arr = new JsonArray();
+                root.add("ignoreList", arr);
+            }
+
+            if (add) {
+                // Scan for a case-insensitive match before appending to dedupe.
+                for (int i = 0; i < arr.size(); i++) {
+                    JsonElement item = arr.get(i);
+                    if (item != null && item.isJsonPrimitive()
+                            && item.getAsJsonPrimitive().isString()
+                            && item.getAsString().trim().toLowerCase().equals(lowered)) {
+                        return true;  // already present — caller treats as success
+                    }
+                }
+                arr.add(lowered);
+            } else {
+                Iterator<JsonElement> it = arr.iterator();
+                while (it.hasNext()) {
+                    JsonElement item = it.next();
+                    if (item != null && item.isJsonPrimitive()
+                            && item.getAsJsonPrimitive().isString()
+                            && item.getAsString().trim().toLowerCase().equals(lowered)) {
+                        it.remove();
+                    }
+                }
+            }
+
+            String pretty = new GsonBuilder().setPrettyPrinting().create().toJson(root);
+            Files.write(path, pretty.getBytes(StandardCharsets.UTF_8));
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 }

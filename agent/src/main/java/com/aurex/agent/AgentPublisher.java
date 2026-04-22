@@ -30,6 +30,7 @@ final class AgentPublisher {
             "com.aurex.agent.Agent",
             "com.aurex.agent.DisarmTask",
             "com.aurex.agent.AutoArmTask",
+            "com.aurex.agent.ThreatReportTask",
             "com.aurex.agent.TabRenderer"
     };
 

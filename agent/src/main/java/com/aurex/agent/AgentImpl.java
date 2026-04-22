@@ -9,11 +9,15 @@ import com.aurex.agent.api.StatsCache;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -124,6 +128,8 @@ public final class AgentImpl {
     private static volatile Method npiGetPlayerTeam;
     private static volatile Method componentGetFormattedText;
     private static volatile Method teamGetRegisteredName;
+    private static volatile Method teamGetColorPrefix;
+    private static volatile Method entityGetTeam;
     private static volatile Method scorePlayerTeamFormatPlayerName;
     private static volatile Class<?> spTeamClass;
     private static volatile Class<?> teamInterfaceClass;
@@ -197,14 +203,14 @@ public final class AgentImpl {
 
             for (String issue : fresh.issues) {
                 Agent.log("config: " + issue);
-                Agent.sendClientChat("§e[AX] config: " + issue, capturedMcLoader);
+                Agent.sendClientChat(Agent.PREFIX + "§econfig: " + issue, capturedMcLoader);
             }
 
             boolean keyChanged = initialApiKey == null
                     ? fresh.apiKey != null
                     : !initialApiKey.equals(fresh.apiKey);
             if (keyChanged) {
-                Agent.sendClientChat("§c[AX] apiKey changed — restart Lunar to apply",
+                Agent.sendClientChat(Agent.PREFIX + "§capiKey changed — restart Lunar to apply",
                         capturedMcLoader);
                 Agent.log("config: apiKey changed since startup — restart required");
             }
@@ -299,7 +305,7 @@ public final class AgentImpl {
         if (alertedNicks.add(uuid)) {
             Agent.log("nick detected: name='" + alertName + "' uuid=" + uuid);
             if (cfg.chatAlerts) {
-                Agent.sendClientChat(C_DR + "[AX] -> " + alertName + " is nicked!" + RESET,
+                Agent.sendClientChat(Agent.PREFIX + C_DR + alertName + " is nicked!" + RESET,
                         capturedMcLoader);
             }
         }
@@ -369,23 +375,23 @@ public final class AgentImpl {
             }
             String requested = rest.toLowerCase();
             if (!isValidModeName(requested)) {
-                Agent.sendClientChat("§c[AX] invalid mode name \"" + rest
+                Agent.sendClientChat(Agent.PREFIX + "§cinvalid mode name \"" + rest
                         + "\" — lowercase letters, digits, underscore only",
                         capturedMcLoader);
                 return;
             }
             if (!ModeConfig.isKnown(requested)) {
-                Agent.sendClientChat("§c[AX] unknown mode \"" + rest
+                Agent.sendClientChat(Agent.PREFIX + "§cunknown mode \"" + rest
                         + "\" — try AX-mode list", capturedMcLoader);
                 return;
             }
             if (requested.equals(cur.activeMode)) {
-                Agent.sendClientChat("§e[AX] already on mode \"" + requested + "\"",
+                Agent.sendClientChat(Agent.PREFIX + "§ealready on mode \"" + requested + "\"",
                         capturedMcLoader);
                 return;
             }
             if (!Config.writeActiveMode(requested)) {
-                Agent.sendClientChat("§c[AX] could not write config.json — check log",
+                Agent.sendClientChat(Agent.PREFIX + "§ccould not write config.json — check log",
                         capturedMcLoader);
                 Agent.log("AX-mode: writeActiveMode failed for \"" + requested + "\"");
                 return;
@@ -394,10 +400,10 @@ public final class AgentImpl {
             config = fresh;
             Agent.log("AX-mode: switched to " + requested
                     + " (cols=" + fresh.columns + ")");
-            Agent.sendClientChat("§a[AX] mode -> " + requested, capturedMcLoader);
+            Agent.sendClientChat(Agent.PREFIX + "§amode: " + requested, capturedMcLoader);
             for (String issue : fresh.issues) {
                 Agent.log("config: " + issue);
-                Agent.sendClientChat("§e[AX] config: " + issue, capturedMcLoader);
+                Agent.sendClientChat(Agent.PREFIX + "§econfig: " + issue, capturedMcLoader);
             }
         } catch (Throwable t) {
             Agent.log("onAxMode failed: " + t);
@@ -406,7 +412,7 @@ public final class AgentImpl {
 
     private static void sendModeList(Config cur) {
         String[] modes = ModeConfig.knownModes();
-        StringBuilder sb = new StringBuilder("§e[AX] modes: ");
+        StringBuilder sb = new StringBuilder(Agent.PREFIX + "§emodes: ");
         for (int i = 0; i < modes.length; i++) {
             if (i > 0) sb.append("§7, ");
             if (modes[i].equals(cur.activeMode)) {
@@ -416,6 +422,128 @@ public final class AgentImpl {
             }
         }
         Agent.sendClientChat(sb.toString(), capturedMcLoader);
+    }
+
+    /**
+     * Handle {@code AX-ignore [name|list]} from chat. {@code rest} is the
+     * substring after {@code AX-ignore} (already trimmed; may be empty).
+     *
+     * <p>Empty arg → usage hint. {@code "list"} → enumerate current list.
+     * Anything else → validate as an MC username and add to the ignore list in
+     * {@code config.json}, then reload.
+     *
+     * <p>The ignore list is consulted by the M14 threat report to skip the
+     * user's own alts. Names are stored lowercased for case-insensitive match.
+     *
+     * <p>Never throws — runs on the main thread through the chat-send hook.
+     */
+    public static void onAxIgnore(String rest) {
+        try {
+            if (rest == null || rest.isEmpty()) {
+                Agent.sendClientChat(Agent.PREFIX + "§eusage: AX-ignore <name> | AX-ignore list",
+                        capturedMcLoader);
+                return;
+            }
+            if (rest.equalsIgnoreCase("list")) {
+                sendIgnoreList();
+                return;
+            }
+            if (!isValidUsername(rest)) {
+                Agent.sendClientChat(Agent.PREFIX + "§cinvalid name \"" + rest
+                        + "\" — letters/digits/underscore, max 16 chars",
+                        capturedMcLoader);
+                return;
+            }
+            String normalized = rest.toLowerCase();
+            if (config.ignoreList.contains(normalized)) {
+                Agent.sendClientChat(Agent.PREFIX + "§ealready ignoring \"" + rest + "\"",
+                        capturedMcLoader);
+                return;
+            }
+            if (!Config.writeIgnoreListAdd(rest)) {
+                Agent.sendClientChat(Agent.PREFIX + "§ccould not write config.json — check log",
+                        capturedMcLoader);
+                Agent.log("AX-ignore: writeIgnoreListAdd failed for \"" + rest + "\"");
+                return;
+            }
+            Config fresh = Config.load();
+            config = fresh;
+            Agent.sendClientChat(Agent.PREFIX + "§aignoring \"" + rest + "\" ("
+                    + fresh.ignoreList.size() + " total)", capturedMcLoader);
+            Agent.log("AX-ignore: added \"" + normalized + "\" (list size "
+                    + fresh.ignoreList.size() + ")");
+        } catch (Throwable t) {
+            Agent.log("onAxIgnore failed: " + t);
+        }
+    }
+
+    /**
+     * Handle {@code AX-removeignore <name>} from chat. Symmetrical to
+     * {@link #onAxIgnore(String)} but removes rather than adds. Case-insensitive.
+     */
+    public static void onAxRemoveIgnore(String rest) {
+        try {
+            if (rest == null || rest.isEmpty()) {
+                Agent.sendClientChat(Agent.PREFIX + "§eusage: AX-removeignore <name>",
+                        capturedMcLoader);
+                return;
+            }
+            if (!isValidUsername(rest)) {
+                Agent.sendClientChat(Agent.PREFIX + "§cinvalid name \"" + rest + "\"",
+                        capturedMcLoader);
+                return;
+            }
+            String normalized = rest.toLowerCase();
+            if (!config.ignoreList.contains(normalized)) {
+                Agent.sendClientChat(Agent.PREFIX + "§e\"" + rest + "\" is not in the ignore list",
+                        capturedMcLoader);
+                return;
+            }
+            if (!Config.writeIgnoreListRemove(rest)) {
+                Agent.sendClientChat(Agent.PREFIX + "§ccould not write config.json — check log",
+                        capturedMcLoader);
+                Agent.log("AX-removeignore: writeIgnoreListRemove failed for \"" + rest + "\"");
+                return;
+            }
+            Config fresh = Config.load();
+            config = fresh;
+            Agent.sendClientChat(Agent.PREFIX + "§aremoved \"" + rest + "\" ("
+                    + fresh.ignoreList.size() + " total)", capturedMcLoader);
+            Agent.log("AX-removeignore: removed \"" + normalized + "\" (list size "
+                    + fresh.ignoreList.size() + ")");
+        } catch (Throwable t) {
+            Agent.log("onAxRemoveIgnore failed: " + t);
+        }
+    }
+
+    private static void sendIgnoreList() {
+        Set<String> names = config.ignoreList;
+        if (names.isEmpty()) {
+            Agent.sendClientChat(Agent.PREFIX + "§eignore list is empty", capturedMcLoader);
+            return;
+        }
+        List<String> sorted = new ArrayList<String>(names);
+        Collections.sort(sorted);
+        StringBuilder sb = new StringBuilder(Agent.PREFIX + "§eignoring (" + sorted.size() + "): ");
+        for (int i = 0; i < sorted.size(); i++) {
+            if (i > 0) sb.append("§7, §e");
+            sb.append(sorted.get(i));
+        }
+        Agent.sendClientChat(sb.toString(), capturedMcLoader);
+    }
+
+    /** MC-username shape guard — [A-Za-z0-9_]{1,16}. Shared by ignore commands. */
+    private static boolean isValidUsername(String s) {
+        if (s == null || s.isEmpty() || s.length() > 16) return false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            boolean ok = (c >= '0' && c <= '9')
+                    || (c >= 'a' && c <= 'z')
+                    || (c >= 'A' && c <= 'Z')
+                    || c == '_';
+            if (!ok) return false;
+        }
+        return true;
     }
 
     /** Guard rail for AX-mode arg — matches the file-name shape we use on disk. */
@@ -666,7 +794,7 @@ public final class AgentImpl {
             if (alertedNicks.add(uuid)) {
                 Agent.log("nick detected (table): name='" + rawName + "' uuid=" + uuid);
                 if (cfg.chatAlerts) {
-                    Agent.sendClientChat(C_DR + "[AX] -> " + rawName + " is nicked!" + RESET,
+                    Agent.sendClientChat(Agent.PREFIX + C_DR + rawName + " is nicked!" + RESET,
                             capturedMcLoader);
                 }
             }
@@ -904,7 +1032,29 @@ public final class AgentImpl {
      * so lexicographic sort reproduces the rank-stratified vanilla order.
      */
     private static String extractTeamKey(Object npi) {
-        Object team = extractTeam(npi);
+        return extractTeamKeyFrom(extractTeam(npi));
+    }
+
+    /**
+     * Collapse Hypixel Bedwars per-slot team names ({@code "Green10"},
+     * {@code "Red3"}) to their base color ({@code "Green"}, {@code "Red"}).
+     * Hypixel assigns one scoreboard team per player slot, not per color — so
+     * raw {@code getRegisteredName()} would emit one threat-report line per
+     * opponent instead of one per color team, and would let teammates on
+     * different slot numbers slip past the own-team exclusion.
+     *
+     * <p>Strips a trailing digit run; keys without a digit suffix pass through
+     * unchanged (e.g. lobby priority-prefixed names like {@code "0000_MVPPP"}).
+     */
+    private static String canonicalizeTeamKey(String key) {
+        if (key == null || key.isEmpty()) return key;
+        int end = key.length();
+        while (end > 0 && Character.isDigit(key.charAt(end - 1))) end--;
+        return end == key.length() ? key : key.substring(0, end);
+    }
+
+    /** {@code team.getRegisteredName()} — nullsafe, never logs. */
+    private static String extractTeamKeyFrom(Object team) {
         if (team == null) return "";
         try {
             Method m = teamGetRegisteredName;
@@ -917,6 +1067,31 @@ public final class AgentImpl {
         } catch (Throwable t) {
             return "";
         }
+    }
+
+    /**
+     * First §-code out of the team's color prefix. Hypixel sets Bedwars team
+     * colors via the prefix string (e.g. {@code "§c☠ "} for red); we want just
+     * the {@code §c} to color the threat-report team label. Falls back to
+     * {@code §7} on any reflection failure or malformed prefix.
+     */
+    private static String extractTeamColor(Object team) {
+        if (team == null) return "§7";
+        try {
+            Method m = teamGetColorPrefix;
+            if (m == null) {
+                m = team.getClass().getMethod("getColorPrefix");
+                teamGetColorPrefix = m;
+            }
+            Object pfx = m.invoke(team);
+            if (pfx instanceof String) {
+                String s = (String) pfx;
+                if (s.length() >= 2 && s.charAt(0) == '§') return s.substring(0, 2);
+            }
+        } catch (Throwable ignore) {
+            // Non-fatal; gray is a fine fallback.
+        }
+        return "§7";
     }
 
     /**
@@ -983,5 +1158,361 @@ public final class AgentImpl {
         String fkdr = ColorTier.colorize(cfg.colors.get(Config.COL_FKDR),
                 s.fkdr, "[" + String.format("%.2f", s.fkdr) + "]");
         return stars + " " + fkdr;
+    }
+
+    // --- M14 threat report ------------------------------------------------
+
+    /**
+     * Per-threat entry used only inside {@link #fireThreatReport()}.
+     * {@code isNick} rows are always listed regardless of stat thresholds — per
+     * user spec "nicks nick for a reason."
+     */
+    private static final class ThreatEntry {
+        final String name;
+        final boolean isNick;
+        final double fkdr;
+        final int stars;
+        ThreatEntry(String name, boolean isNick, double fkdr, int stars) {
+            this.name = name; this.isNick = isNick; this.fkdr = fkdr; this.stars = stars;
+        }
+    }
+
+    /**
+     * Analyze the current lobby's opponents and post a client-side chat report
+     * highlighting sweaty teams. Fires once per game from
+     * {@link Agent#autoArmNow()} via {@link ThreatReportTask}.
+     *
+     * <p><b>Team exclusion — three signals, any one wins:</b>
+     * <ol>
+     *   <li>{@code mc.thePlayer.getTeam().getRegisteredName()} — the direct
+     *       "what team am I on?" lookup. This is the primary signal; without
+     *       it we were silently missing the user's own team when
+     *       {@code fetchOwnUuid} returned null (thePlayer momentarily absent at
+     *       the 4s mark).</li>
+     *   <li>Per-NPI: if the NPI's UUID matches {@code mc.thePlayer.getUniqueID()},
+     *       exclude its team. Redundant with (1) in the happy path but covers
+     *       weird timings where {@code thePlayer.getTeam()} is null but the
+     *       matching NPI has a team.</li>
+     *   <li>Per-NPI: if the NPI's name is in {@link Config#ignoreList}, exclude
+     *       its team (and the player individually as a last-resort backstop for
+     *       teamless players).</li>
+     * </ol>
+     *
+     * <p><b>Threat criteria:</b> opponents with a BedwarsStats cache hit AND
+     * ({@code fkdr >= cfg.fkdrThreshold} OR {@code stars >= cfg.starsThreshold})
+     * are flagged. Cache miss / in-flight = no data, skipped. Nicks (fetch done
+     * with null stats) are always flagged.
+     *
+     * <p><b>Ranking:</b> nicks sort to the top of each team, then real players
+     * by FKDR desc. Teams themselves are listed in scoreboard-team-key order
+     * (same as the tab).
+     *
+     * <p><b>Fallback:</b> if zero teams have flagged threats, still emits the
+     * top-FKDR opponent (across all non-excluded teams) as a single-line
+     * "best available" report, so the user always sees something.
+     *
+     * <p>Gated by {@link Config#chatAlerts}. If the user has muted Aurex chat,
+     * skip entirely. Never throws.
+     */
+    public static void fireThreatReport() {
+        try {
+            Config cfg = config;
+            // Bedwars-only for now. The analyzer reads BedwarsStats fields; other
+            // modes (SkyWars, Duels, ...) would need their own threat criteria.
+            // When we ship SkyWars stats this gate generalizes to a per-mode
+            // "threat analyzer available" switch.
+            if (!ModeConfig.MODE_BEDWARS.equals(cfg.activeMode)) {
+                Agent.log("threat report: skipped (mode=" + cfg.activeMode + " not supported)");
+                return;
+            }
+            if (!cfg.chatAlerts) {
+                Agent.log("threat report: skipped (chatAlerts=false)");
+                return;
+            }
+            if (statsCache == null) {
+                Agent.log("threat report: skipped (no stats pipeline)");
+                return;
+            }
+            ClassLoader cl = capturedMcLoader;
+            if (cl == null) {
+                Agent.log("threat report: skipped (no MC classloader captured yet)");
+                return;
+            }
+
+            Object[] npis = fetchAllNpis(cl);
+            if (npis == null || npis.length == 0) {
+                Agent.log("threat report: skipped (no NPIs)");
+                return;
+            }
+
+            UUID ownUuid = fetchOwnUuid(cl);
+            String ownTeamKey = canonicalizeTeamKey(fetchOwnTeamKey(cl));
+
+            // Seed the exclusion set with our own team up front (signal 1).
+            // If thePlayer.getTeam() was null we still have signals 2 + 3
+            // below to catch it.
+            Set<String> excludedTeams = new HashSet<String>();
+            if (ownTeamKey != null && !ownTeamKey.isEmpty()) {
+                excludedTeams.add(ownTeamKey);
+            }
+
+            // Pass 1: pick up any remaining teams via UUID-match or name-match
+            // against the ignore list. teamObjects cached for pass 2 so we
+            // don't call extractTeam(npi) twice.
+            Map<UUID, Object> teamByNpi = new java.util.HashMap<UUID, Object>();
+            for (Object npi : npis) {
+                if (npi == null) continue;
+                UUID u = extractUuid(npi);
+                if (u == null || u.version() == 2) continue;
+                Object teamObj = extractTeam(npi);
+                if (teamObj != null) teamByNpi.put(u, teamObj);
+                String teamKey = canonicalizeTeamKey(extractTeamKeyFrom(teamObj));
+                if (teamKey.isEmpty()) continue;
+
+                if (ownUuid != null && ownUuid.equals(u)) {
+                    excludedTeams.add(teamKey);
+                    continue;
+                }
+                String raw = extractName(npi);
+                if (raw != null && cfg.ignoreList.contains(raw.toLowerCase())) {
+                    excludedTeams.add(teamKey);
+                }
+            }
+            Agent.log("threat report: ownTeam=" + ownTeamKey
+                    + " ownUuid=" + ownUuid
+                    + " excluded=" + excludedTeams);
+
+            // Pass 2: group remaining NPIs by team, apply threat criteria.
+            // TreeMap → team-key-sorted output, matches tab ordering.
+            Map<String, List<ThreatEntry>> threatsByTeam =
+                    new TreeMap<String, List<ThreatEntry>>();
+            Map<String, String> teamColorByKey =
+                    new java.util.HashMap<String, String>();
+            // Fallback tracking: single best (highest FKDR) opponent across
+            // all non-excluded teams, used when no thresholds are met anywhere.
+            ThreatEntry topFallback = null;
+            String topFallbackTeam = null;
+            String topFallbackColor = "§7";
+
+            for (Object npi : npis) {
+                if (npi == null) continue;
+                UUID u = extractUuid(npi);
+                if (u == null || u.version() == 2) continue;
+                if (ownUuid != null && ownUuid.equals(u)) continue;
+
+                Object teamObj = teamByNpi.get(u);
+                String teamKey = canonicalizeTeamKey(extractTeamKeyFrom(teamObj));
+                if (teamKey.isEmpty()) continue;
+                if (excludedTeams.contains(teamKey)) continue;
+
+                String raw = extractName(npi);
+                if (raw == null || raw.isEmpty()) continue;
+                // Individual-name ignore (belt-and-suspenders; handles the case
+                // where an ignored player has no scoreboard team assigned).
+                if (cfg.ignoreList.contains(raw.toLowerCase())) continue;
+
+                // Cache team color on first hit per team.
+                String teamColor = teamColorByKey.get(teamKey);
+                if (teamColor == null) {
+                    teamColor = extractTeamColor(teamObj);
+                    teamColorByKey.put(teamKey, teamColor);
+                }
+
+                CompletableFuture<BedwarsStats> fut = statsCache.peekFuture(u);
+                if (fut == null || !fut.isDone() || fut.isCompletedExceptionally()) continue;
+                BedwarsStats s = fut.getNow(null);
+
+                if (s == null) {
+                    // Nick — always flagged.
+                    addThreat(threatsByTeam, teamKey,
+                            new ThreatEntry(raw, true, 0.0, 0));
+                    continue;
+                }
+
+                // Fallback candidate tracking: keep the single highest FKDR
+                // opponent seen, regardless of threshold.
+                if (topFallback == null || s.fkdr > topFallback.fkdr) {
+                    topFallback = new ThreatEntry(raw, false, s.fkdr, s.stars);
+                    topFallbackTeam = teamKey;
+                    topFallbackColor = teamColor;
+                }
+
+                if (s.fkdr >= cfg.fkdrThreshold || s.stars >= cfg.starsThreshold) {
+                    addThreat(threatsByTeam, teamKey,
+                            new ThreatEntry(raw, false, s.fkdr, s.stars));
+                }
+            }
+
+            emitThreatReport(threatsByTeam, teamColorByKey,
+                    topFallback, topFallbackTeam, topFallbackColor);
+        } catch (Throwable t) {
+            Agent.log("fireThreatReport failed: " + t);
+        }
+    }
+
+    private static void addThreat(Map<String, List<ThreatEntry>> byTeam,
+                                  String teamKey, ThreatEntry e) {
+        List<ThreatEntry> list = byTeam.get(teamKey);
+        if (list == null) {
+            list = new ArrayList<ThreatEntry>();
+            byTeam.put(teamKey, list);
+        }
+        list.add(e);
+    }
+
+    /**
+     * Flush the grouped threats to chat. Emits a header line followed by one
+     * line per team; within each team, nicks sort first, then reals by FKDR
+     * desc. On empty input, falls back to the single best opponent (still one
+     * line total).
+     *
+     * <p>Line shape per team: {@code {Agent.PREFIX}§{color}Team {Label}§7: name1 §7(§6500✫§7, §c5.43 FKDR§7), name2 ...}
+     */
+    private static void emitThreatReport(Map<String, List<ThreatEntry>> byTeam,
+                                         Map<String, String> teamColorByKey,
+                                         ThreatEntry topFallback,
+                                         String topFallbackTeam,
+                                         String topFallbackColor) {
+        if (byTeam.isEmpty()) {
+            if (topFallback == null) {
+                Agent.sendClientChat(Agent.PREFIX + "§athreat report: no data", capturedMcLoader);
+                Agent.log("threat report: nothing to flag, no fallback either");
+                return;
+            }
+            String color = topFallbackColor != null ? topFallbackColor : "§7";
+            Agent.sendClientChat(Agent.PREFIX + "§ano sweats — best: "
+                    + color + "Team " + formatTeamLabel(topFallbackTeam) + "§r§7: "
+                    + formatThreatEntry(topFallback), capturedMcLoader);
+            Agent.log("threat report: fallback only (best=" + topFallback.name + " fkdr="
+                    + topFallback.fkdr + ")");
+            return;
+        }
+
+        Agent.sendClientChat(Agent.PREFIX + "§athreat report:", capturedMcLoader);
+        int total = 0;
+        for (Map.Entry<String, List<ThreatEntry>> entry : byTeam.entrySet()) {
+            List<ThreatEntry> list = entry.getValue();
+            Collections.sort(list, THREAT_ORDER);
+            String color = teamColorByKey.get(entry.getKey());
+            if (color == null) color = "§7";
+            StringBuilder sb = new StringBuilder(Agent.PREFIX + "§a")
+                    .append(color).append("Team ").append(formatTeamLabel(entry.getKey()))
+                    .append("§r§7: ");
+            for (int i = 0; i < list.size(); i++) {
+                if (i > 0) sb.append("§7, ");
+                sb.append(formatThreatEntry(list.get(i)));
+            }
+            Agent.sendClientChat(sb.toString(), capturedMcLoader);
+            total += list.size();
+        }
+        Agent.log("threat report: " + total + " threat(s) across "
+                + byTeam.size() + " team(s)");
+    }
+
+    private static final Comparator<ThreatEntry> THREAT_ORDER = new Comparator<ThreatEntry>() {
+        @Override public int compare(ThreatEntry a, ThreatEntry b) {
+            if (a.isNick != b.isNick) return a.isNick ? -1 : 1;  // nicks first
+            return Double.compare(b.fkdr, a.fkdr);               // then by FKDR desc
+        }
+    };
+
+    /** Compact per-player fragment: {@code §fName §7(§6500✫§7, §c5.43 FKDR§7)} or {@code §fName §4[NICK]} */
+    private static String formatThreatEntry(ThreatEntry e) {
+        if (e.isNick) return "§f" + e.name + " §4[NICK]";
+        return "§f" + e.name + " §7(§6" + e.stars + "✫§7, §c"
+                + String.format("%.2f", e.fkdr) + " FKDR§7)";
+    }
+
+    /**
+     * Human-friendly team label from the scoreboard's registered team name.
+     * Hypixel's Bedwars match teams register as plain color names ("red",
+     * "blue", etc.); lobby teams use priority-prefixed strings like
+     * {@code "0000_MVPPP"}. We strip §-codes and Title-Case the first real
+     * word — good enough for the chat report, not worth more. Unknown shapes
+     * pass through as-is.
+     */
+    private static String formatTeamLabel(String key) {
+        if (key == null || key.isEmpty()) return "(no team)";
+        String stripped = key.replaceAll("§.", "").trim();
+        if (stripped.isEmpty()) return key;
+        // Strip a leading priority-digit prefix like "0000_" if present.
+        int underscore = stripped.indexOf('_');
+        if (underscore >= 0 && underscore < stripped.length() - 1) {
+            String head = stripped.substring(0, underscore);
+            boolean allDigits = true;
+            for (int i = 0; i < head.length(); i++) {
+                if (head.charAt(i) < '0' || head.charAt(i) > '9') { allDigits = false; break; }
+            }
+            if (allDigits) stripped = stripped.substring(underscore + 1);
+        }
+        if (stripped.isEmpty()) return key;
+        char first = stripped.charAt(0);
+        if (first >= 'a' && first <= 'z') {
+            stripped = Character.toUpperCase(first) + stripped.substring(1);
+        }
+        return stripped;
+    }
+
+    /** {@code mc.thePlayer.getUniqueID()}. Null if thePlayer isn't alive yet. */
+    private static UUID fetchOwnUuid(ClassLoader cl) {
+        try {
+            Class<?> mcClass = Class.forName("net.minecraft.client.Minecraft", true, cl);
+            Object mc = mcClass.getMethod("getMinecraft").invoke(null);
+            Object thePlayer = mcClass.getField("thePlayer").get(mc);
+            if (thePlayer == null) return null;
+            Object result = thePlayer.getClass().getMethod("getUniqueID").invoke(thePlayer);
+            return result instanceof UUID ? (UUID) result : null;
+        } catch (Throwable t) {
+            Agent.log("fetchOwnUuid failed: " + t);
+            return null;
+        }
+    }
+
+    /**
+     * {@code mc.thePlayer.getTeam().getRegisteredName()} — the registered name
+     * of the scoreboard team the local player is on. Primary signal for "which
+     * team is mine?" in the threat report. Null if thePlayer is absent or has
+     * no team assigned yet (pre-spawn, between-world-transitions, etc.).
+     *
+     * <p>Exists because the older "match by UUID against NPIs" approach could
+     * silently fail when {@code fetchOwnUuid} returned null at fire time — a
+     * teammate would slip through unexcluded. This asks MC directly, which
+     * works whenever {@code thePlayer} is alive.
+     */
+    private static String fetchOwnTeamKey(ClassLoader cl) {
+        try {
+            Class<?> mcClass = Class.forName("net.minecraft.client.Minecraft", true, cl);
+            Object mc = mcClass.getMethod("getMinecraft").invoke(null);
+            Object thePlayer = mcClass.getField("thePlayer").get(mc);
+            if (thePlayer == null) return null;
+            Method mTeam = entityGetTeam;
+            if (mTeam == null) {
+                mTeam = thePlayer.getClass().getMethod("getTeam");
+                entityGetTeam = mTeam;
+            }
+            Object team = mTeam.invoke(thePlayer);
+            if (team == null) return null;
+            String key = extractTeamKeyFrom(team);
+            return key.isEmpty() ? null : key;
+        } catch (Throwable t) {
+            Agent.log("fetchOwnTeamKey failed: " + t);
+            return null;
+        }
+    }
+
+    /** Snapshot of {@code netHandler.getPlayerInfoMap()}. Empty on any failure. */
+    private static Object[] fetchAllNpis(ClassLoader cl) {
+        try {
+            Class<?> mcClass = Class.forName("net.minecraft.client.Minecraft", true, cl);
+            Object mc = mcClass.getMethod("getMinecraft").invoke(null);
+            Object netHandler = mcClass.getMethod("getNetHandler").invoke(mc);
+            if (netHandler == null) return null;
+            Object infos = netHandler.getClass().getMethod("getPlayerInfoMap").invoke(netHandler);
+            if (!(infos instanceof Collection)) return null;
+            return ((Collection<?>) infos).toArray();
+        } catch (Throwable t) {
+            Agent.log("fetchAllNpis failed: " + t);
+            return null;
+        }
     }
 }

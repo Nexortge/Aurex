@@ -44,6 +44,10 @@ import java.util.Set;
  *     "stars": [{"min": 0, "color": "gray"}, {"min": 100, "color": "white"}, ...],
  *     "fkdr":  [{"min": 0, "color": "gray"}, {"min": 1, "color": "white"}, ...],
  *     ...
+ *   },
+ *   "alerts": {
+ *     "fkdrThreshold":  5.0,
+ *     "starsThreshold": 500
  *   }
  * }
  * </pre>
@@ -59,6 +63,11 @@ public final class ModeConfig {
 
     /** Mode names we have defaults for. Drives {@code AX-mode list} + auto-generate. */
     public static final String MODE_BEDWARS = "bedwars";
+
+    /** Default FKDR above which an opponent counts as a Bedwars threat. */
+    public static final double BW_DEFAULT_FKDR_THRESHOLD = 5.0;
+    /** Default stars above which an opponent counts as a Bedwars threat. */
+    public static final int BW_DEFAULT_STARS_THRESHOLD = 500;
 
     private static final Set<String> KNOWN_MODES;
     static {
@@ -222,14 +231,21 @@ public final class ModeConfig {
     public final Map<String, List<ColorTier>> colors;
     /** Column id → display label used for tab headers. Backfilled with built-in defaults. */
     public final Map<String, String> headers;
+    /** Minimum FKDR to flag an opponent as a threat in the game-start report. */
+    public final double fkdrThreshold;
+    /** Minimum stars to flag an opponent as a threat in the game-start report. */
+    public final int starsThreshold;
 
     private ModeConfig(String mode, List<String> columns,
                        Map<String, List<ColorTier>> colors,
-                       Map<String, String> headers) {
+                       Map<String, String> headers,
+                       double fkdrThreshold, int starsThreshold) {
         this.mode = mode;
         this.columns = columns;
         this.colors = colors;
         this.headers = headers;
+        this.fkdrThreshold = fkdrThreshold;
+        this.starsThreshold = starsThreshold;
     }
 
     /** Header label for {@code col}, or the column id itself if no mapping exists. */
@@ -355,6 +371,26 @@ public final class ModeConfig {
                 patched = true;
             }
         }
+
+        // Alerts block — fkdr/stars threshold for the game-start threat report.
+        // Same self-heal shape as headers: if missing, inject with defaults so
+        // a pre-M14 user file becomes editable without a wipe.
+        JsonObject alerts;
+        if (root.has("alerts") && root.get("alerts").isJsonObject()) {
+            alerts = root.getAsJsonObject("alerts");
+        } else {
+            alerts = new JsonObject();
+            root.add("alerts", alerts);
+            patched = true;
+        }
+        if (!alerts.has("fkdrThreshold")) {
+            alerts.addProperty("fkdrThreshold", BW_DEFAULT_FKDR_THRESHOLD);
+            patched = true;
+        }
+        if (!alerts.has("starsThreshold")) {
+            alerts.addProperty("starsThreshold", BW_DEFAULT_STARS_THRESHOLD);
+            patched = true;
+        }
         return patched;
     }
 
@@ -387,11 +423,13 @@ public final class ModeConfig {
             return new ModeConfig(mode,
                     Collections.unmodifiableList(cols),
                     Collections.unmodifiableMap(colors),
-                    Collections.unmodifiableMap(headers));
+                    Collections.unmodifiableMap(headers),
+                    BW_DEFAULT_FKDR_THRESHOLD, BW_DEFAULT_STARS_THRESHOLD);
         }
         return new ModeConfig(mode, Collections.<String>emptyList(),
                 Collections.<String, List<ColorTier>>emptyMap(),
-                Collections.<String, String>emptyMap());
+                Collections.<String, String>emptyMap(),
+                BW_DEFAULT_FKDR_THRESHOLD, BW_DEFAULT_STARS_THRESHOLD);
     }
 
     /** Build the JSON tree for writing as the initial {@code modes/&lt;mode&gt;.json}. */
@@ -413,6 +451,11 @@ public final class ModeConfig {
                 colors.add(e.getKey(), tiersToJson(e.getValue()));
             }
             root.add("colors", colors);
+
+            JsonObject alerts = new JsonObject();
+            alerts.addProperty("fkdrThreshold", BW_DEFAULT_FKDR_THRESHOLD);
+            alerts.addProperty("starsThreshold", BW_DEFAULT_STARS_THRESHOLD);
+            root.add("alerts", alerts);
         } else {
             // Unknown mode — produce an empty skeleton so the file exists and
             // the user can start filling it in. The load path flags it as
@@ -420,6 +463,7 @@ public final class ModeConfig {
             root.add("columns", new JsonArray());
             root.add("headers", new JsonObject());
             root.add("colors", new JsonObject());
+            root.add("alerts", new JsonObject());
         }
         return root;
     }
@@ -430,6 +474,7 @@ public final class ModeConfig {
         List<String> cols = parseColumns(mode, root, issues);
         Map<String, List<ColorTier>> colors = parseColors(mode, root, issues);
         Map<String, String> headers = parseHeaders(mode, root, issues);
+        double[] alerts = parseAlerts(mode, root, issues);
 
         // Backfill any missing column tiers / headers with defaults — keeps old
         // user files forward-compatible when we add new stat columns to defaults.
@@ -449,7 +494,48 @@ public final class ModeConfig {
         return new ModeConfig(mode,
                 Collections.unmodifiableList(cols),
                 Collections.unmodifiableMap(colors),
-                Collections.unmodifiableMap(headers));
+                Collections.unmodifiableMap(headers),
+                alerts[0], (int) alerts[1]);
+    }
+
+    /**
+     * Parse the per-mode {@code alerts} block — FKDR + stars thresholds for the
+     * game-start threat report. Missing block or individual missing fields fall
+     * back to {@link #BW_DEFAULT_FKDR_THRESHOLD} / {@link #BW_DEFAULT_STARS_THRESHOLD}.
+     *
+     * <p>Returns a two-element {@code double[]}: {@code [fkdrThreshold, starsThreshold]}.
+     * Using a primitive array instead of a tuple class to keep surface area
+     * small — only the parse → constructor path uses it.
+     */
+    private static double[] parseAlerts(String mode, JsonObject root, List<String> issues) {
+        double fkdr = BW_DEFAULT_FKDR_THRESHOLD;
+        int stars = BW_DEFAULT_STARS_THRESHOLD;
+        if (!root.has("alerts") || root.get("alerts").isJsonNull()) {
+            return new double[] { fkdr, stars };
+        }
+        JsonElement el = root.get("alerts");
+        if (!el.isJsonObject()) {
+            issues.add("mode " + mode + ": alerts must be an object — using defaults");
+            return new double[] { fkdr, stars };
+        }
+        JsonObject obj = el.getAsJsonObject();
+        if (obj.has("fkdrThreshold") && !obj.get("fkdrThreshold").isJsonNull()) {
+            JsonElement v = obj.get("fkdrThreshold");
+            if (v.isJsonPrimitive() && v.getAsJsonPrimitive().isNumber()) {
+                fkdr = v.getAsDouble();
+            } else {
+                issues.add("mode " + mode + ": alerts.fkdrThreshold must be a number — using default " + fkdr);
+            }
+        }
+        if (obj.has("starsThreshold") && !obj.get("starsThreshold").isJsonNull()) {
+            JsonElement v = obj.get("starsThreshold");
+            if (v.isJsonPrimitive() && v.getAsJsonPrimitive().isNumber()) {
+                stars = v.getAsInt();
+            } else {
+                issues.add("mode " + mode + ": alerts.starsThreshold must be an integer — using default " + stars);
+            }
+        }
+        return new double[] { fkdr, stars };
     }
 
     private static List<String> parseColumns(String mode, JsonObject root, List<String> issues) {

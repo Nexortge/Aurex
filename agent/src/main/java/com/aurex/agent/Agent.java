@@ -37,6 +37,18 @@ public final class Agent {
     /** Marker line prefix for everything we write. Makes grep easy. */
     private static final String TAG = "Aurex";
 
+    /**
+     * Standard prefix for every Aurex chat line. {@code §5} dark purple
+     * brackets, {@code §l§d} bold pink {@code AX} inside, trailing {@code -> }
+     * arrow. Callers append their own §-colored content after this — trailing
+     * space already included.
+     *
+     * <p>Published on every classloader copy of Agent (app / bootstrap / MC)
+     * so {@link AgentImpl} and the MC-loader tasks ({@link DisarmTask},
+     * {@link ThreatReportTask}, etc.) can reference it directly.
+     */
+    public static final String PREFIX = "§5[§l§dAX§r§5] -> ";
+
     private Agent() {}
 
     /** Runtime attach — our primary path (loader calls loadAgent). */
@@ -263,6 +275,15 @@ public final class Agent {
     private static final long POST_START_DELAY_MS = 2000L;
 
     /**
+     * How long after {@link #autoArmNow()} we wait before running the M14
+     * threat report. The auto-arm kicks off fetches asynchronously; this delay
+     * gives {@link com.aurex.agent.api.StatsCache} time to settle before we
+     * snapshot it. Slightly longer than {@link #AUTO_ARM_MS} so in-flight
+     * requests have a full fetch window + 1s to land.
+     */
+    static final long THREAT_REPORT_DELAY_MS = 4000L;
+
+    /**
      * Generation token for the pending {@link AutoArmTask}. Countdown ticks
      * bump this at reschedule time; the scheduled task captures it, and
      * no-ops at fire time if it's been superseded. Mirrors the {@code disarmAt}
@@ -302,7 +323,7 @@ public final class Agent {
                 return true;
             }
             if (trimmed.equalsIgnoreCase("AX-status")) {
-                sendClientChat("\u00a7e[AX] display=" + (displayEnabled ? "on" : "off")
+                sendClientChat(PREFIX + "§edisplay=" + (displayEnabled ? "on" : "off")
                         + " fetch=" + (fetchArmed ? "armed" : "idle"));
                 return true;
             }
@@ -314,13 +335,26 @@ public final class Agent {
                 onAxMode(rest);
                 return true;
             }
+            // AX-removeignore is a longer prefix than AX-ignore — test it first so
+            // "AX-removeignore Foo" doesn't match the AX-ignore branch with rest
+            // = "removeignore Foo" (which would fail isValidUsername and confuse).
+            if (isAxRemoveIgnoreCommand(trimmed)) {
+                String rest = trimmed.length() > 15 ? trimmed.substring(15).trim() : "";
+                onAxIgnoreBridge(rest, true);
+                return true;
+            }
+            if (isAxIgnoreCommand(trimmed)) {
+                String rest = trimmed.length() > 9 ? trimmed.substring(9).trim() : "";
+                onAxIgnoreBridge(rest, false);
+                return true;
+            }
             // Typo guard: anything that LOOKS like a botched AX command —
             // starts with "ax" (case-insensitive), optional space, then dash or
             // underscore — gets swallowed and hinted instead of broadcasting
             // the typo to public chat. Catches "AX-onn", "ax-stats", "AX_on",
             // "ax -on", "AX _status", etc.
             if (looksLikeAxCommand(trimmed)) {
-                sendClientChat("§e[AX] unknown: \"" + trimmed
+                sendClientChat(PREFIX + "§eunknown: \"" + trimmed
                         + "\" — try AX-on / AX-off / AX-status");
                 log("swallowed unknown AX command: " + trimmed);
                 return true;
@@ -450,12 +484,30 @@ public final class Agent {
      * {@link #looksLikeAxCommand} so "AX-modex" doesn't accidentally route here.
      */
     private static boolean isAxModeCommand(String s) {
-        if (s.length() < 7) return false;
-        String prefix = "ax-mode";
-        for (int i = 0; i < 7; i++) {
+        return matchesAxPrefix(s, "ax-mode");
+    }
+
+    private static boolean isAxIgnoreCommand(String s) {
+        return matchesAxPrefix(s, "ax-ignore");
+    }
+
+    private static boolean isAxRemoveIgnoreCommand(String s) {
+        return matchesAxPrefix(s, "ax-removeignore");
+    }
+
+    /**
+     * Case-insensitive prefix match: {@code s} starts with {@code prefix} and is
+     * either the same length or immediately followed by a space. Used by all
+     * AX-{@code <word>} [arg] command dispatchers to ensure e.g. "AX-modex" doesn't
+     * accidentally match "AX-mode".
+     */
+    private static boolean matchesAxPrefix(String s, String prefix) {
+        int n = prefix.length();
+        if (s.length() < n) return false;
+        for (int i = 0; i < n; i++) {
             if (Character.toLowerCase(s.charAt(i)) != prefix.charAt(i)) return false;
         }
-        return s.length() == 7 || s.charAt(7) == ' ';
+        return s.length() == n || s.charAt(n) == ' ';
     }
 
     /**
@@ -479,6 +531,41 @@ public final class Agent {
 
     private static volatile Method implOnAxModeMethod;
 
+    /**
+     * Bridge for {@code AX-ignore}/{@code AX-removeignore} into
+     * {@link AgentImpl}. {@code removing=false} dispatches to
+     * {@code AgentImpl.onAxIgnore}; {@code removing=true} to
+     * {@code AgentImpl.onAxRemoveIgnore}. Same classloader-hop pattern as
+     * {@link #onAxMode(String)} — reflective call into bootstrap so the MC
+     * copy of Agent doesn't need a compile-time reference to AgentImpl.
+     */
+    private static void onAxIgnoreBridge(String rest, boolean removing) {
+        try {
+            Method m;
+            if (removing) {
+                m = implOnAxRemoveIgnoreMethod;
+                if (m == null) {
+                    m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                            .getMethod("onAxRemoveIgnore", String.class);
+                    implOnAxRemoveIgnoreMethod = m;
+                }
+            } else {
+                m = implOnAxIgnoreMethod;
+                if (m == null) {
+                    m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                            .getMethod("onAxIgnore", String.class);
+                    implOnAxIgnoreMethod = m;
+                }
+            }
+            m.invoke(null, rest);
+        } catch (Throwable t) {
+            log("onAxIgnoreBridge(" + removing + ") failed: " + t);
+        }
+    }
+
+    private static volatile Method implOnAxIgnoreMethod;
+    private static volatile Method implOnAxRemoveIgnoreMethod;
+
     private static boolean looksLikeAxCommand(String s) {
         if (s.length() < 3) return false;
         char c0 = Character.toLowerCase(s.charAt(0));
@@ -497,7 +584,7 @@ public final class Agent {
         displayEnabled = true;
         fetchArmed = true;
         log("AX-on (display on; fetch armed for " + ARM_MS + "ms)");
-        sendClientChat("\u00a7a[AX] on (fetch 3s)");
+        sendClientChat(PREFIX + "§aon (fetch 3s)");
         // Timer.schedule(task, delay) — task.run() fires on the Timer's thread
         // after delay ms. DisarmTask checks disarmAt == fireAt before actually
         // disarming, so a later arm() simply invalidates this task.
@@ -526,7 +613,12 @@ public final class Agent {
         fetchArmed = true;
         timer.schedule(new DisarmTask(fireAt, false), AUTO_ARM_MS);
         kickoffFetches();
-        log("auto-arm fired (window " + AUTO_ARM_MS + "ms)");
+        // AutoArmTask's token dance ensures this fires exactly once per
+        // countdown sequence, so the threat report piggy-backs on it — no
+        // extra dedup needed here.
+        timer.schedule(new ThreatReportTask(), THREAT_REPORT_DELAY_MS);
+        log("auto-arm fired (window " + AUTO_ARM_MS + "ms, threat report in "
+                + THREAT_REPORT_DELAY_MS + "ms)");
     }
 
     /**
@@ -587,13 +679,38 @@ public final class Agent {
 
     private static volatile Method implPreWarmMethod;
 
+    /**
+     * Bootstrap-hop to {@link AgentImpl#fireThreatReport()}. Called from
+     * {@link ThreatReportTask} on the Timer thread after the game-start
+     * countdown has completed and fetches have had time to settle.
+     *
+     * <p>Never throws — a failed report just means no chat line. Auto-arm
+     * itself already fired successfully before we got here, so the user's
+     * tab view is unaffected either way.
+     */
+    static void fireThreatReport() {
+        try {
+            Method m = implFireThreatReportMethod;
+            if (m == null) {
+                m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                        .getMethod("fireThreatReport");
+                implFireThreatReportMethod = m;
+            }
+            m.invoke(null);
+        } catch (Throwable t) {
+            log("fireThreatReport bridge failed: " + t);
+        }
+    }
+
+    private static volatile Method implFireThreatReportMethod;
+
     private static void disarm(boolean announce) {
         displayEnabled = false;
         fetchArmed = false;
         disarmAt = 0L;
         clearNickAlerts();
         log("AX-off (display + fetch off)");
-        if (announce) sendClientChat("\u00a7c[AX] off");
+        if (announce) sendClientChat(PREFIX + "§coff");
     }
 
     /**
