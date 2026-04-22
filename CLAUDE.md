@@ -26,9 +26,16 @@ A Seraph-style stat overlay **injected into Lunar Client** (Minecraft 1.8.9) tha
 
 - Lunar launcher: `C:\Users\nexor\AppData\Local\Programs\Lunar Client\`
 - Lunar per-user data: `C:\Users\nexor\.lunarclient\`
-- Our config (planned): `%APPDATA%\Aurex\config.json`
-- Our log (planned): `%APPDATA%\Aurex\agent.log`
+- Our global config: `%APPDATA%\Aurex\config.json` — `apiKey`, `activeMode`, `nickDetection`, `chatAlerts`. Identity-scoped; doesn't change on mode switch.
+- Our per-mode configs: `%APPDATA%\Aurex\modes\<mode>.json` — `columns`, `colors`. One file per game mode (`bedwars.json` ships first). Swapped wholesale via `AX-mode <name>`.
+- Our log: `%APPDATA%\Aurex\agent.log`
 - Lunar main class (confirmed via `jps -l`): `com.moonsworth.lunar.genesis.Genesis`
+
+## Chat commands (in-game)
+
+- `AX-on` / `AX-off` / `AX-status` — arm/disarm display + fetch; status readout.
+- `AX-mode` / `AX-mode list` — list known modes (active one marked with `§a*`).
+- `AX-mode <name>` — persist `activeMode` to `config.json` and hot-reload. Auto-generates `modes/<name>.json` with defaults if missing.
 
 ## Project layout (planned)
 

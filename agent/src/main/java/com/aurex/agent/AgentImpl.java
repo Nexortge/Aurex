@@ -1,8 +1,10 @@
 package com.aurex.agent;
 
 import com.aurex.agent.api.BedwarsStats;
+import com.aurex.agent.api.ColorTier;
 import com.aurex.agent.api.Config;
 import com.aurex.agent.api.HypixelClient;
+import com.aurex.agent.api.ModeConfig;
 import com.aurex.agent.api.StatsCache;
 
 import java.lang.reflect.Method;
@@ -10,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -41,20 +44,12 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class AgentImpl {
 
-    // Standard Bedwars prestige colors. Each 100 stars = next tier.
-    private static final String C_GRAY   = "§7";
-    private static final String C_WHITE  = "§f";
-    private static final String C_YELLOW = "§e";
-    private static final String C_GOLD   = "§6";
-    private static final String C_RED    = "§c";
-    private static final String C_AQUA   = "§b";
-    private static final String C_DG     = "§2"; // dark green — emerald
-    private static final String C_DA     = "§3"; // dark aqua — sapphire
-    private static final String C_DR     = "§4"; // dark red — ruby
-    private static final String C_LP     = "§d"; // light purple — crystal
-    private static final String C_BLUE   = "§9"; // blue — opal
-    private static final String C_DP     = "§5"; // dark purple — amethyst
-    private static final String RESET    = "§r";
+    // §-codes for non-tier cells (NICK prefix, placeholders, fallbacks).
+    // Tier-based coloring for stats columns lives in Config.colors — see
+    // ColorTier.colorize at the call sites in formatCell / formatStatsPrefix.
+    private static final String C_GRAY = "§7";
+    private static final String C_DR   = "§4"; // dark red — NICK tag
+    private static final String RESET  = "§r";
 
     /** Shown while a fetch is in flight. Trailing space so it butts up against the original name. */
     private static final String PLACEHOLDER = C_GRAY + "[...]" + RESET + " ";
@@ -97,6 +92,13 @@ public final class AgentImpl {
      * log doesn't fill up every frame. Same lifecycle as {@link #alertedNicks}.
      */
     private static final Set<UUID> skippedNicks = ConcurrentHashMap.newKeySet();
+
+    /**
+     * UUIDs we've already logged from the v4-only tab/prewarm filter. One line
+     * per UUID per session — enough to eyeball the version distribution across
+     * real players / NPCs / nicks without flooding the log at render rate.
+     */
+    private static final Set<UUID> loggedFiltered = ConcurrentHashMap.newKeySet();
 
     /**
      * First MC-loader we see an NPI through, cached for {@link Agent#sendClientChat}.
@@ -153,7 +155,8 @@ public final class AgentImpl {
                 Agent.log("stats: no API key (HYPIXEL_API_KEY env or %APPDATA%\\Aurex\\config.json); running without stats");
                 return null;
             }
-            Agent.log("stats: API key loaded; pipeline ready (columns=" + config.columns
+            Agent.log("stats: API key loaded; pipeline ready (mode=" + config.activeMode
+                    + " columns=" + config.columns
                     + " nicks=" + config.nickDetection + " alerts=" + config.chatAlerts + ")");
             return new StatsCache(new HypixelClient(key, Agent::log));
         } catch (Throwable t) {
@@ -186,7 +189,8 @@ public final class AgentImpl {
             Config fresh = Config.load();
             config = fresh;
 
-            Agent.log("config reloaded (" + fresh.columns.size() + " cols"
+            Agent.log("config reloaded (mode=" + fresh.activeMode
+                    + ", " + fresh.columns.size() + " cols"
                     + ", nicks=" + fresh.nickDetection
                     + ", alerts=" + fresh.chatAlerts
                     + ", issues=" + fresh.issues.size() + ")");
@@ -247,7 +251,7 @@ public final class AgentImpl {
 
             BedwarsStats stats = fut.getNow(null);
             if (stats == null) return handleNick(uuid, originalName);
-            return formatStatsPrefix(stats) + " " + originalName;
+            return formatStatsPrefix(stats, config) + " " + originalName;
         } catch (Throwable t) {
             return originalName;
         }
@@ -271,13 +275,15 @@ public final class AgentImpl {
         Config cfg = config;
         if (!cfg.nickDetection) return originalName;
 
-        // Real Mojang-minted player UUIDs are always v4 (random). Hypixel
-        // assigns v2/v3 UUIDs to server-generated entities (lobby NPCs,
-        // shopkeepers, Firework Frank, etc.) — filter those by version nibble.
-        // Cheaper and more accurate than any name-shape heuristic.
-        if (uuid.version() != 4) {
+        // UUID version distribution on Hypixel tab (observed 2026-04-22):
+        //   v1 = nicks (time-based, opaque to name — denick-proof by design)
+        //   v2 = NPCs / synthetic server entities (Firework Frank, shopkeepers)
+        //   v4 = real Mojang-minted player accounts
+        // So: skip v2 (NPCs), let v1 + v4 through. Previously we only allowed
+        // v4, which swallowed nicks alongside NPCs.
+        if (uuid.version() == 2) {
             if (skippedNicks.add(uuid)) {
-                Agent.log("nick skipped (non-v4 UUID, likely NPC): original='" + originalName + "' uuid=" + uuid);
+                Agent.log("nick skipped (v2 UUID, NPC): original='" + originalName + "' uuid=" + uuid);
             }
             return originalName;
         }
@@ -340,6 +346,90 @@ public final class AgentImpl {
     }
 
     /**
+     * Handle {@code AX-mode [name]} from chat. {@code rest} is the substring
+     * after {@code AX-mode} (already trimmed; may be empty).
+     *
+     * <p>Empty or {@code "list"} → list known modes, highlighting the active one.
+     * Otherwise validate the name, write {@code activeMode} to {@code config.json}
+     * (preserving other fields), reload the full config, and announce the switch.
+     *
+     * <p>Reloading via {@link Config#load()} pulls in the new mode's
+     * {@code modes/&lt;mode&gt;.json} (auto-generating it with defaults if missing) —
+     * the same code path {@link #onServerJoin} uses, so any parse issues flush
+     * to chat identically.
+     *
+     * <p>Never throws — runs on Lunar's main thread through the chat-send hook.
+     */
+    public static void onAxMode(String rest) {
+        try {
+            Config cur = config;
+            if (rest == null || rest.isEmpty() || rest.equalsIgnoreCase("list")) {
+                sendModeList(cur);
+                return;
+            }
+            String requested = rest.toLowerCase();
+            if (!isValidModeName(requested)) {
+                Agent.sendClientChat("§c[AX] invalid mode name \"" + rest
+                        + "\" — lowercase letters, digits, underscore only",
+                        capturedMcLoader);
+                return;
+            }
+            if (!ModeConfig.isKnown(requested)) {
+                Agent.sendClientChat("§c[AX] unknown mode \"" + rest
+                        + "\" — try AX-mode list", capturedMcLoader);
+                return;
+            }
+            if (requested.equals(cur.activeMode)) {
+                Agent.sendClientChat("§e[AX] already on mode \"" + requested + "\"",
+                        capturedMcLoader);
+                return;
+            }
+            if (!Config.writeActiveMode(requested)) {
+                Agent.sendClientChat("§c[AX] could not write config.json — check log",
+                        capturedMcLoader);
+                Agent.log("AX-mode: writeActiveMode failed for \"" + requested + "\"");
+                return;
+            }
+            Config fresh = Config.load();
+            config = fresh;
+            Agent.log("AX-mode: switched to " + requested
+                    + " (cols=" + fresh.columns + ")");
+            Agent.sendClientChat("§a[AX] mode -> " + requested, capturedMcLoader);
+            for (String issue : fresh.issues) {
+                Agent.log("config: " + issue);
+                Agent.sendClientChat("§e[AX] config: " + issue, capturedMcLoader);
+            }
+        } catch (Throwable t) {
+            Agent.log("onAxMode failed: " + t);
+        }
+    }
+
+    private static void sendModeList(Config cur) {
+        String[] modes = ModeConfig.knownModes();
+        StringBuilder sb = new StringBuilder("§e[AX] modes: ");
+        for (int i = 0; i < modes.length; i++) {
+            if (i > 0) sb.append("§7, ");
+            if (modes[i].equals(cur.activeMode)) {
+                sb.append("§a*").append(modes[i]).append("§e");
+            } else {
+                sb.append("§e").append(modes[i]);
+            }
+        }
+        Agent.sendClientChat(sb.toString(), capturedMcLoader);
+    }
+
+    /** Guard rail for AX-mode arg — matches the file-name shape we use on disk. */
+    private static boolean isValidModeName(String s) {
+        if (s == null || s.isEmpty() || s.length() > 32) return false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            boolean ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    /**
      * Build header/column metadata + one row per viable {@code NetworkPlayerInfo}.
      * Called from {@link Agent#getTabData(Object[], Object, Object)} via the
      * standard bootstrap hop.
@@ -396,7 +486,14 @@ public final class AgentImpl {
                 if (capturedMcLoader == null) capturedMcLoader = npi.getClass().getClassLoader();
                 UUID uuid = extractUuid(npi);
                 if (uuid == null) continue;
-                if (uuid.version() != 4) continue;  // NPC filter (same as getTabData)
+                // Skip v2 (NPCs). v1 = nicks, v4 = real players — both fetch-worthy.
+                if (uuid.version() == 2) {
+                    if (loggedFiltered.add(uuid)) {
+                        Agent.log("filter(preWarm) skip NPC: v2 uuid=" + uuid
+                                + " name='" + extractName(npi) + "'");
+                    }
+                    continue;
+                }
                 // StatsCache.get dedups in-flight requests AND serves cached
                 // results instantly — so this is a no-op for UUIDs we already
                 // have fresh data for, and a no-double-fire for UUIDs whose
@@ -413,7 +510,7 @@ public final class AgentImpl {
     public static Object[] getTabData(Object[] npis, Object scoreboard, Object objective, boolean fetchArmed) {
         Config cfg = config;
         String[] colIds = cfg.columns.toArray(new String[0]);
-        String[] headers = buildHeaders(cfg.columns);
+        String[] headers = buildHeaders(cfg);
         if (npis == null || statsCache == null) {
             return new Object[] { colIds, headers, Collections.emptyList() };
         }
@@ -425,9 +522,24 @@ public final class AgentImpl {
 
                 UUID uuid = extractUuid(npi);
                 if (uuid == null) continue;
-                if (uuid.version() != 4) continue;  // NPC filter (M7 learning)
 
                 String name = extractName(npi);
+
+                // v2 = NPC / synthetic server entity. Render as an NPC row
+                // (tagged, blank stats, sinks to bottom) so users can eyeball
+                // game-start player counts and see shopkeepers in the table
+                // instead of them vanishing entirely.
+                if (uuid.version() == 2) {
+                    if (loggedFiltered.add(uuid)) {
+                        Agent.log("filter(tab) NPC row: v2 uuid=" + uuid + " name='" + name + "'");
+                    }
+                    String rawName = name != null ? name : "";
+                    String display = extractDisplayName(npi, rawName);
+                    String teamKey = extractTeamKey(npi);
+                    raws.add(new RawRow(npi, uuid, rawName, display, teamKey, null, RowStatus.NPC, -1));
+                    continue;
+                }
+
                 if (name == null) continue;
 
                 int hp = extractHealth(name, scoreboard, objective);
@@ -438,7 +550,7 @@ public final class AgentImpl {
 
             List<Object[]> rowEntries = new ArrayList<Object[]>(raws.size());
             for (RawRow r : raws) {
-                rowEntries.add(new Object[] { r.npi, formatRow(r, cfg.columns) });
+                rowEntries.add(new Object[] { r.npi, formatRow(r, cfg) });
             }
             return new Object[] { colIds, headers, rowEntries };
         } catch (Throwable t) {
@@ -483,26 +595,20 @@ public final class AgentImpl {
         }
     }
 
-    private static String[] buildHeaders(List<String> cols) {
+    private static String[] buildHeaders(Config cfg) {
+        List<String> cols = cfg.columns;
+        Map<String, String> headers = cfg.headers;
         String[] h = new String[cols.size()];
-        for (int i = 0; i < cols.size(); i++) h[i] = headerFor(cols.get(i));
+        for (int i = 0; i < cols.size(); i++) {
+            String col = cols.get(i);
+            String label = headers.get(col);
+            h[i] = label != null ? label : col;  // defaults backfilled by ModeConfig
+        }
         return h;
     }
 
-    private static String headerFor(String col) {
-        switch (col) {
-            case Config.COL_STARS:  return "✫";
-            case Config.COL_NAME:   return "Name";
-            case Config.COL_FKDR:   return "FKDR";
-            case Config.COL_WL:     return "W/L";
-            case Config.COL_WINS:   return "Wins";
-            case Config.COL_HEALTH: return "HP";
-            default: return col;  // unreachable — Config filtered already
-        }
-    }
-
     /** Row status — drives sort + formatting branches. */
-    private enum RowStatus { REAL, NICK, PLACEHOLDER, UNKNOWN }
+    private enum RowStatus { REAL, NICK, PLACEHOLDER, UNKNOWN, NPC }
 
     /**
      * Intermediate per-row struct pre-formatting. Never escapes this class.
@@ -581,6 +687,11 @@ public final class AgentImpl {
      */
     private static final Comparator<RawRow> ROW_ORDER = new Comparator<RawRow>() {
         @Override public int compare(RawRow a, RawRow b) {
+            // NPCs sink to the bottom of the entire list, regardless of team.
+            boolean an = a.status == RowStatus.NPC;
+            boolean bn = b.status == RowStatus.NPC;
+            if (an != bn) return an ? 1 : -1;
+
             int t = a.teamKey.compareTo(b.teamKey);
             if (t != 0) return t;
             int ra = rank(a.status), rb = rank(b.status);
@@ -595,7 +706,8 @@ public final class AgentImpl {
                 case NICK: return 0;
                 case REAL: return 1;
                 case PLACEHOLDER: return 2;
-                default: return 3; // UNKNOWN
+                case UNKNOWN: return 3;
+                default: return 4;  // NPC — unreachable here (gated above)
             }
         }
     };
@@ -607,32 +719,62 @@ public final class AgentImpl {
      * team color already there); we append RESET so the next cell starts clean.
      * All other cells branch on {@link RowStatus} — REAL gets live stat
      * formatting, NICK/PLACEHOLDER/UNKNOWN get a single fallback glyph.
+     *
+     * <p>Coloring is config-driven: {@link ColorTier#colorize(List, double, String)}
+     * walks {@code cfg.colors.get(colId)} and picks the matching §-code (or the
+     * rainbow per-char cycle for stars ≥ 1000).
      */
-    private static String[] formatRow(RawRow r, List<String> cols) {
+    private static String[] formatRow(RawRow r, Config cfg) {
+        List<String> cols = cfg.columns;
         String[] cells = new String[cols.size()];
         for (int i = 0; i < cols.size(); i++) {
-            cells[i] = formatCell(cols.get(i), r);
+            cells[i] = formatCell(cols.get(i), r, cfg);
         }
         return cells;
     }
 
-    private static String formatCell(String col, RawRow r) {
+    private static String formatCell(String col, RawRow r, Config cfg) {
         String nameCell = r.displayName + RESET;
 
         // Health is independent of API status — a PLACEHOLDER row (stats still
         // fetching) can still render HP as long as the scoreboard objective
         // exists. Handle it before the status-switch.
-        if (col.equals(Config.COL_HEALTH)) return formatHealth(r.health);
+        if (col.equals(Config.COL_HEALTH)) return formatHealth(r.health, cfg);
 
         switch (r.status) {
             case REAL: {
                 BedwarsStats s = r.stats;
                 switch (col) {
-                    case Config.COL_STARS: return starColor(s.stars) + "[" + s.stars + "✫]" + RESET;
-                    case Config.COL_NAME:  return nameCell;
-                    case Config.COL_FKDR:  return fkdrColor(s.fkdr) + "[" + String.format("%.2f", s.fkdr) + "]" + RESET;
-                    case Config.COL_WL:    return C_WHITE + String.format("%.2f", s.wlr) + RESET;
-                    case Config.COL_WINS:  return C_WHITE + formatInt(s.wins) + RESET;
+                    case Config.COL_STARS:
+                        return ColorTier.colorize(cfg.colors.get(Config.COL_STARS),
+                                s.stars, "[" + s.stars + "✫]");
+                    case Config.COL_NAME:
+                        return nameCell;
+                    case Config.COL_FKDR:
+                        return ColorTier.colorize(cfg.colors.get(Config.COL_FKDR),
+                                s.fkdr, "[" + String.format("%.2f", s.fkdr) + "]");
+                    case Config.COL_WL:
+                        return ColorTier.colorize(cfg.colors.get(Config.COL_WL),
+                                s.wlr, String.format("%.2f", s.wlr));
+                    case Config.COL_WINS:
+                        return ColorTier.colorize(cfg.colors.get(Config.COL_WINS),
+                                s.wins, formatInt(s.wins));
+                    case Config.COL_FINALS:
+                        return ColorTier.colorize(cfg.colors.get(Config.COL_FINALS),
+                                s.finalKills, formatInt(s.finalKills));
+                    case Config.COL_BEDS:
+                        return ColorTier.colorize(cfg.colors.get(Config.COL_BEDS),
+                                s.bedsBroken, formatInt(s.bedsBroken));
+                    case Config.COL_WINSTREAK:
+                        if (s.winstreak == null) return CELL_UNKNOWN;
+                        return ColorTier.colorize(cfg.colors.get(Config.COL_WINSTREAK),
+                                s.winstreak, formatInt(s.winstreak));
+                    case Config.COL_KDR:
+                        return ColorTier.colorize(cfg.colors.get(Config.COL_KDR),
+                                s.kdr, String.format("%.2f", s.kdr));
+                    case Config.COL_BBLR:
+                        return ColorTier.colorize(cfg.colors.get(Config.COL_BBLR),
+                                s.bblr, String.format("%.2f", s.bblr));
                     default: return CELL_UNKNOWN;
                 }
             }
@@ -642,6 +784,14 @@ public final class AgentImpl {
                 // always the rendered name regardless.
                 if (col.equals(Config.COL_NAME)) return nameCell;
                 if (col.equals(Config.COL_STARS)) return C_DR + "[NICK]" + RESET;
+                return CELL_UNKNOWN;
+            case NPC:
+                // Synthetic server entity (shopkeeper, game-start placeholder,
+                // info row). Tagged in the stars slot so NPCs are visually
+                // distinct from real/placeholder/unknown rows; name stays so
+                // users can count heads and see who's in the lobby.
+                if (col.equals(Config.COL_NAME)) return nameCell;
+                if (col.equals(Config.COL_STARS)) return C_GRAY + "[NPC]" + RESET;
                 return CELL_UNKNOWN;
             case PLACEHOLDER:
                 if (col.equals(Config.COL_NAME)) return nameCell;
@@ -654,19 +804,14 @@ public final class AgentImpl {
     }
 
     /**
-     * HP cell: coloured 0-20 integer. The raw scoreboard score is the HP
-     * directly — Hypixel mirrors MC's vanilla health criterion, whole
-     * numbers only. Tiers: {@code <= 5} red, {@code <= 10} yellow,
-     * {@code > 10} green. Raw {@code -1} → unknown dash (objective not set,
-     * or player not tracked — typical in Hypixel lobbies).
+     * HP cell: coloured 0-20 integer. Raw {@code -1} → unknown dash (objective
+     * not set, or player not tracked — typical in Hypixel lobbies). Tier
+     * thresholds live in {@code colors.health} in the mode config — defaults
+     * ship as 1-5 red / 6-10 yellow / 11-20 dark_green.
      */
-    private static String formatHealth(int hp) {
+    private static String formatHealth(int hp, Config cfg) {
         if (hp < 0) return CELL_UNKNOWN;
-        String color;
-        if (hp <= 5)      color = C_RED;
-        else if (hp <= 10) color = C_YELLOW;
-        else              color = C_DG;  // dark green — matches Bedwars palette
-        return color + hp + RESET;
+        return ColorTier.colorize(cfg.colors.get(Config.COL_HEALTH), hp, String.valueOf(hp));
     }
 
     /** 1234 → "1,234". Locale-agnostic, thousands separator only. */
@@ -827,37 +972,16 @@ public final class AgentImpl {
         }
     }
 
-    private static String formatStatsPrefix(BedwarsStats s) {
-        return starColor(s.stars) + "[" + s.stars + "✫]" + RESET
-                + " " + fkdrColor(s.fkdr) + "[" + String.format("%.2f", s.fkdr) + "]" + RESET;
-    }
-
     /**
-     * Standard Bedwars prestige palette. 0-99 stone, 100 iron, 200 gold,
-     * 300 diamond, 400 emerald, 500 sapphire, 600 ruby, 700 crystal, 800 opal,
-     * 900 amethyst, 1000+ rainbow (placeholder: solid gold — proper per-char
-     * rainbow is M11 work, tracked alongside FKDR/W/L/Wins coloring).
+     * Stats-prefix string for the M4 decorator path (appended to a vanilla tab
+     * name when the full table layout is off). Uses the same config tiers as
+     * {@link #formatCell} so the two render paths stay in visual sync.
      */
-    private static String starColor(int stars) {
-        if (stars < 100)  return C_GRAY;
-        if (stars < 200)  return C_WHITE;
-        if (stars < 300)  return C_GOLD;
-        if (stars < 400)  return C_AQUA;
-        if (stars < 500)  return C_DG;
-        if (stars < 600)  return C_DA;
-        if (stars < 700)  return C_DR;
-        if (stars < 800)  return C_LP;
-        if (stars < 900)  return C_BLUE;
-        if (stars < 1000) return C_DP;
-        return C_GOLD;
-    }
-
-    /** Skill tiers for FKDR: <1 gray, 1-3 white, 3-5 yellow, 5-10 red, 10+ dark red. */
-    private static String fkdrColor(double fkdr) {
-        if (fkdr < 1)  return C_GRAY;
-        if (fkdr < 3)  return C_WHITE;
-        if (fkdr < 5)  return C_YELLOW;
-        if (fkdr < 10) return C_RED;
-        return C_DR;
+    private static String formatStatsPrefix(BedwarsStats s, Config cfg) {
+        String stars = ColorTier.colorize(cfg.colors.get(Config.COL_STARS),
+                s.stars, "[" + s.stars + "✫]");
+        String fkdr = ColorTier.colorize(cfg.colors.get(Config.COL_FKDR),
+                s.fkdr, "[" + String.format("%.2f", s.fkdr) + "]");
+        return stars + " " + fkdr;
     }
 }

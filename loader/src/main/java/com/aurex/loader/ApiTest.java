@@ -86,13 +86,21 @@ final class ApiTest {
             return;
         }
         System.out.println("  [" + label + " " + ms + "ms] " + stats.displayName);
-        System.out.println("    stars:        " + stats.stars);
-        System.out.println("    final kills:  " + stats.finalKills);
-        System.out.println("    final deaths: " + stats.finalDeaths);
-        System.out.printf ("    FKDR:         %.2f%n", stats.fkdr);
-        System.out.println("    wins:         " + stats.wins);
-        System.out.println("    losses:       " + stats.losses);
-        System.out.printf ("    W/L:          %.2f%n", stats.wlr);
+        System.out.println("    stars:         " + stats.stars);
+        System.out.println("    final kills:   " + stats.finalKills);
+        System.out.println("    final deaths:  " + stats.finalDeaths);
+        System.out.printf ("    FKDR:          %.2f%n", stats.fkdr);
+        System.out.println("    kills:         " + stats.regularKills);
+        System.out.println("    deaths:        " + stats.regularDeaths);
+        System.out.printf ("    KDR:           %.2f%n", stats.kdr);
+        System.out.println("    beds broken:   " + stats.bedsBroken);
+        System.out.println("    beds lost:     " + stats.bedsLost);
+        System.out.printf ("    BBLR:          %.2f%n", stats.bblr);
+        System.out.println("    wins:          " + stats.wins);
+        System.out.println("    losses:        " + stats.losses);
+        System.out.printf ("    W/L:           %.2f%n", stats.wlr);
+        System.out.println("    winstreak:     "
+                + (stats.winstreak == null ? "hidden" : stats.winstreak.toString()));
     }
 
     /** Accept both dashed and undashed UUID forms (Hypixel accepts both too). */

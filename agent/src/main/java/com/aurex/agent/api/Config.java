@@ -1,6 +1,6 @@
 package com.aurex.agent.api;
 
-import com.google.gson.JsonArray;
+import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -16,99 +16,114 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
- * Immutable snapshot of {@code %APPDATA%\Aurex\config.json}.
+ * Immutable snapshot of the Aurex config tree.
  *
- * <p>Replaces the M5-era {@code ApiKeyConfig} — same file, richer schema:
- * <pre>
- * {
- *   "apiKey": "...",
- *   "columns": ["stars", "name", "fkdr", "wl", "wins"],   // order = render order
- *   "nickDetection": true,
- *   "chatAlerts": true,
- *   "colors": { ... }                                     // reserved for M11
- * }
- * </pre>
+ * <p>As of M11 the config is split across two files:
+ * <ul>
+ *   <li>{@code %APPDATA%\Aurex\config.json} — global settings (apiKey,
+ *       activeMode, nickDetection, chatAlerts). Identity-scoped settings that
+ *       don't change when the user swaps game mode.</li>
+ *   <li>{@code %APPDATA%\Aurex\modes\&lt;mode&gt;.json} — per-mode settings
+ *       (columns, colors). Swapped wholesale via {@code AX-mode &lt;name&gt;}.</li>
+ * </ul>
  *
- * <p>Every field is optional. A file containing only {@code apiKey} (the shape
- * M5 shipped with) still loads and gets every other field's default.
- *
- * <p><b>Issue reporting:</b> parse errors are non-fatal — we never refuse to
- * load. Any typed-wrong value, unknown key, or malformed column name goes into
- * {@link #issues} and the caller surfaces them (M9 flushes them to chat on
- * server-join). Defaults apply wherever a field is missing or broken.
+ * <p>{@link #load()} reads both files, auto-generates defaults for either if
+ * missing, and returns one merged snapshot. AgentImpl treats this object as
+ * immutable — a mode switch produces a fresh instance via {@link #load()}.
  *
  * <p><b>API key precedence:</b> {@code HYPIXEL_API_KEY} env var wins over the
  * file. File's {@code apiKey} is only read when the env var is unset.
  *
- * <p><b>Thread-safe:</b> instances are immutable; {@link #load()} can be called
+ * <p><b>Parse errors are non-fatal</b> — anything malformed goes into
+ * {@link #issues} and defaults apply. The Agent flushes these to chat on
+ * server-join so the user sees what's wrong without having to check a log.
+ *
+ * <p><b>Thread-safe:</b> instances are immutable; {@link #load()} is idempotent
  * from any thread.
  */
 public final class Config {
 
-    public static final String COL_STARS  = "stars";
-    public static final String COL_NAME   = "name";
-    public static final String COL_FKDR   = "fkdr";
-    public static final String COL_WL     = "wl";
-    public static final String COL_WINS   = "wins";
-    public static final String COL_HEALTH = "health";
+    public static final String COL_STARS     = "stars";
+    public static final String COL_NAME      = "name";
+    public static final String COL_FKDR      = "fkdr";
+    public static final String COL_WL        = "wl";
+    public static final String COL_WINS      = "wins";
+    public static final String COL_HEALTH    = "health";
+    public static final String COL_FINALS    = "finals";
+    public static final String COL_BEDS      = "beds";
+    public static final String COL_WINSTREAK = "winstreak";
+    public static final String COL_KDR       = "kdr";
+    public static final String COL_BBLR      = "bblr";
 
     private static final Set<String> VALID_COLUMNS;
-    private static final List<String> DEFAULT_COLUMNS;
     private static final Set<String> RECOGNIZED_KEYS;
     static {
         LinkedHashSet<String> valid = new LinkedHashSet<String>();
-        valid.add(COL_STARS); valid.add(COL_NAME); valid.add(COL_FKDR);
-        valid.add(COL_WL);    valid.add(COL_WINS); valid.add(COL_HEALTH);
+        valid.add(COL_STARS);  valid.add(COL_NAME);      valid.add(COL_FKDR);
+        valid.add(COL_WL);     valid.add(COL_WINS);      valid.add(COL_HEALTH);
+        valid.add(COL_FINALS); valid.add(COL_BEDS);      valid.add(COL_WINSTREAK);
+        valid.add(COL_KDR);    valid.add(COL_BBLR);
         VALID_COLUMNS = Collections.unmodifiableSet(valid);
 
-        // Default column set (what a user with no `columns` key gets). Health is
-        // intentionally NOT in defaults — it's only populated on Hypixel during
-        // matches, so an empty "HP" column in lobby would look broken. Users
-        // who want it opt in via config.
-        LinkedHashSet<String> def = new LinkedHashSet<String>();
-        def.add(COL_STARS); def.add(COL_NAME); def.add(COL_FKDR);
-        def.add(COL_WL);    def.add(COL_WINS);
-        DEFAULT_COLUMNS = Collections.unmodifiableList(new ArrayList<String>(def));
-
         LinkedHashSet<String> keys = new LinkedHashSet<String>(Arrays.asList(
-                "apiKey", "columns", "nickDetection", "chatAlerts", "colors"));
+                "apiKey", "activeMode", "nickDetection", "chatAlerts"));
         RECOGNIZED_KEYS = Collections.unmodifiableSet(keys);
+    }
+
+    /** Used by ModeConfig to validate user-specified column ids. */
+    public static boolean isValidColumn(String name) {
+        return name != null && VALID_COLUMNS.contains(name);
     }
 
     private static final String ENV_VAR = "HYPIXEL_API_KEY";
     private static final String APP_DIR = "Aurex";
     private static final String FILE_NAME = "config.json";
+    private static final String DEFAULT_MODE = ModeConfig.MODE_BEDWARS;
 
-    /** @return canonical config-file path. {@code null} on non-Windows (no APPDATA). */
+    /** {@code %APPDATA%\Aurex\config.json}. {@code null} on non-Windows. */
     public static Path resolveConfigPath() {
         String appData = System.getenv("APPDATA");
         if (appData == null || appData.isEmpty()) return null;
         return Paths.get(appData, APP_DIR, FILE_NAME);
     }
 
+    // --- instance --------------------------------------------------------
+
     public final String apiKey;
-    public final List<String> columns;
+    public final String activeMode;
     public final boolean nickDetection;
     public final boolean chatAlerts;
-    /** Non-fatal parse issues. Each string is a human-readable one-liner. */
+    /** The loaded mode config — source of columns + colors. Never null. */
+    public final ModeConfig modeConfig;
+    /** Non-fatal parse issues from BOTH files. Flushed to chat on server-join. */
     public final List<String> issues;
 
-    private Config(String apiKey, List<String> columns,
+    // Convenience passthroughs so AgentImpl call sites stay flat.
+    public final List<String> columns;
+    public final Map<String, List<ColorTier>> colors;
+    public final Map<String, String> headers;
+
+    private Config(String apiKey, String activeMode,
                    boolean nickDetection, boolean chatAlerts,
-                   List<String> issues) {
+                   ModeConfig modeConfig, List<String> issues) {
         this.apiKey = apiKey;
-        this.columns = columns;
+        this.activeMode = activeMode;
         this.nickDetection = nickDetection;
         this.chatAlerts = chatAlerts;
+        this.modeConfig = modeConfig;
         this.issues = issues;
+        this.columns = modeConfig.columns;
+        this.colors = modeConfig.colors;
+        this.headers = modeConfig.headers;
     }
 
     /**
-     * Read + parse the config file. Never throws — on any failure we log an
-     * issue and keep going with defaults.
+     * Read + parse both config files. Never throws — any failure yields a
+     * defaults-only Config with issue notes.
      */
     public static Config load() {
         List<String> issues = new ArrayList<String>();
@@ -116,42 +131,111 @@ public final class Config {
         String envKey = System.getenv(ENV_VAR);
         String apiKey = (envKey != null && !envKey.trim().isEmpty()) ? envKey.trim() : null;
 
-        JsonObject root = null;
-        Path path = resolveConfigPath();
-        if (path != null && Files.exists(path)) {
-            try (Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
-                JsonElement el = JsonParser.parseReader(reader);
-                if (el != null && el.isJsonObject()) {
-                    root = el.getAsJsonObject();
-                } else {
-                    issues.add("config root must be a JSON object — using defaults");
-                }
-            } catch (IOException e) {
-                issues.add("could not read config file: " + e.getMessage());
-            } catch (Exception e) {
-                issues.add("could not parse config file: " + e.getMessage());
-            }
-        }
+        JsonObject root = readOrCreateGlobal(issues);
 
-        List<String> columns = DEFAULT_COLUMNS;
+        String activeMode = DEFAULT_MODE;
         boolean nickDetection = true;
         boolean chatAlerts = true;
 
         if (root != null) {
             if (apiKey == null) apiKey = readString(root, "apiKey", issues);
-            columns = readColumns(root, issues);
+            String modeStr = readString(root, "activeMode", issues);
+            if (modeStr != null) {
+                String norm = modeStr.toLowerCase();
+                if (!ModeConfig.isKnown(norm)) {
+                    issues.add("unknown activeMode \"" + modeStr + "\" — using " + DEFAULT_MODE);
+                } else {
+                    activeMode = norm;
+                }
+            }
             nickDetection = readBool(root, "nickDetection", true, issues);
             chatAlerts = readBool(root, "chatAlerts", true, issues);
 
             for (String key : root.keySet()) {
                 if (!RECOGNIZED_KEYS.contains(key)) {
-                    issues.add("unknown key \"" + key + "\" — ignored");
+                    issues.add("unknown key \"" + key + "\" in config.json — ignored");
                 }
             }
         }
 
-        return new Config(apiKey, columns, nickDetection, chatAlerts,
-                Collections.unmodifiableList(issues));
+        ModeConfig modeConfig = ModeConfig.load(activeMode, issues);
+
+        return new Config(apiKey, activeMode, nickDetection, chatAlerts,
+                modeConfig, Collections.unmodifiableList(issues));
+    }
+
+    /**
+     * Update {@code activeMode} in {@code config.json} without clobbering other
+     * fields. Called from the {@code AX-mode} chat command. Creates the file
+     * if missing.
+     *
+     * <p>Returns {@code true} on success; {@code false} on any I/O or parse
+     * failure (caller surfaces the error in chat).
+     */
+    public static boolean writeActiveMode(String mode) {
+        if (mode == null || mode.isEmpty()) return false;
+        Path path = resolveConfigPath();
+        if (path == null) return false;
+        try {
+            if (path.getParent() != null) Files.createDirectories(path.getParent());
+            JsonObject root = null;
+            if (Files.exists(path)) {
+                try (Reader r = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+                    JsonElement el = JsonParser.parseReader(r);
+                    if (el != null && el.isJsonObject()) root = el.getAsJsonObject();
+                }
+            }
+            if (root == null) root = buildDefaultGlobalJson();
+            root.addProperty("activeMode", mode);
+            String pretty = new GsonBuilder().setPrettyPrinting().create().toJson(root);
+            Files.write(path, pretty.getBytes(StandardCharsets.UTF_8));
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    // --- helpers ---------------------------------------------------------
+
+    private static JsonObject readOrCreateGlobal(List<String> issues) {
+        Path path = resolveConfigPath();
+        if (path == null) return null;
+        if (!Files.exists(path)) {
+            try {
+                if (path.getParent() != null) Files.createDirectories(path.getParent());
+                JsonObject def = buildDefaultGlobalJson();
+                String pretty = new GsonBuilder().setPrettyPrinting().create().toJson(def);
+                Files.write(path, pretty.getBytes(StandardCharsets.UTF_8));
+                issues.add("created default config at " + path);
+                return def;
+            } catch (IOException e) {
+                issues.add("could not write default config: " + e.getMessage());
+                return null;
+            }
+        }
+        try (Reader r = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+            JsonElement el = JsonParser.parseReader(r);
+            if (el == null || !el.isJsonObject()) {
+                issues.add("config root must be a JSON object — using defaults");
+                return null;
+            }
+            return el.getAsJsonObject();
+        } catch (IOException e) {
+            issues.add("could not read config file: " + e.getMessage());
+            return null;
+        } catch (Exception e) {
+            issues.add("could not parse config file: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private static JsonObject buildDefaultGlobalJson() {
+        JsonObject o = new JsonObject();
+        o.addProperty("apiKey", "");
+        o.addProperty("activeMode", DEFAULT_MODE);
+        o.addProperty("nickDetection", true);
+        o.addProperty("chatAlerts", true);
+        return o;
     }
 
     private static String readString(JsonObject o, String key, List<String> issues) {
@@ -173,40 +257,5 @@ public final class Config {
             return defaultValue;
         }
         return el.getAsBoolean();
-    }
-
-    private static List<String> readColumns(JsonObject root, List<String> issues) {
-        if (!root.has("columns") || root.get("columns").isJsonNull()) return DEFAULT_COLUMNS;
-        JsonElement el = root.get("columns");
-        if (!el.isJsonArray()) {
-            issues.add("columns must be an array — using defaults");
-            return DEFAULT_COLUMNS;
-        }
-        JsonArray arr = el.getAsJsonArray();
-        List<String> result = new ArrayList<String>(arr.size());
-        Set<String> seen = new LinkedHashSet<String>();
-        for (int i = 0; i < arr.size(); i++) {
-            JsonElement e = arr.get(i);
-            if (!e.isJsonPrimitive() || !e.getAsJsonPrimitive().isString()) {
-                issues.add("columns[" + i + "]: not a string — skipped");
-                continue;
-            }
-            String raw = e.getAsString();
-            String name = raw.trim().toLowerCase();
-            if (!VALID_COLUMNS.contains(name)) {
-                issues.add("unknown column \"" + raw + "\" — skipped");
-                continue;
-            }
-            if (!seen.add(name)) {
-                issues.add("duplicate column \"" + name + "\" — skipped");
-                continue;
-            }
-            result.add(name);
-        }
-        if (result.isEmpty()) {
-            issues.add("columns list ended up empty — using defaults");
-            return DEFAULT_COLUMNS;
-        }
-        return Collections.unmodifiableList(result);
     }
 }

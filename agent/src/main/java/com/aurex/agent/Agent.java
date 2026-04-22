@@ -306,6 +306,14 @@ public final class Agent {
                         + " fetch=" + (fetchArmed ? "armed" : "idle"));
                 return true;
             }
+            // AX-mode [name] — list known modes, or switch active mode and hot-reload.
+            // Handled BEFORE the typo guard so "AX-mode" alone (no arg) reaches the
+            // list branch instead of being dismissed as unknown.
+            if (isAxModeCommand(trimmed)) {
+                String rest = trimmed.length() > 7 ? trimmed.substring(7).trim() : "";
+                onAxMode(rest);
+                return true;
+            }
             // Typo guard: anything that LOOKS like a botched AX command —
             // starts with "ax" (case-insensitive), optional space, then dash or
             // underscore — gets swallowed and hinted instead of broadcasting
@@ -436,6 +444,41 @@ public final class Agent {
      * prints a client-side hint — the goal is to keep typos like {@code ax_on}
      * or {@code AX -status} off public chat.
      */
+    /**
+     * Shape-match against {@code AX-mode}: a case-insensitive {@code "ax-mode"}
+     * prefix, followed by either end-of-string or a single space. Tighter than
+     * {@link #looksLikeAxCommand} so "AX-modex" doesn't accidentally route here.
+     */
+    private static boolean isAxModeCommand(String s) {
+        if (s.length() < 7) return false;
+        String prefix = "ax-mode";
+        for (int i = 0; i < 7; i++) {
+            if (Character.toLowerCase(s.charAt(i)) != prefix.charAt(i)) return false;
+        }
+        return s.length() == 7 || s.charAt(7) == ' ';
+    }
+
+    /**
+     * Hop into {@link AgentImpl#onAxMode(String)} — validate, write, hot-reload
+     * the config, and announce in chat. Same classloader-bridge pattern as the
+     * other Impl calls on this class.
+     */
+    private static void onAxMode(String rest) {
+        try {
+            Method m = implOnAxModeMethod;
+            if (m == null) {
+                m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                        .getMethod("onAxMode", String.class);
+                implOnAxModeMethod = m;
+            }
+            m.invoke(null, rest);
+        } catch (Throwable t) {
+            log("onAxMode bridge failed: " + t);
+        }
+    }
+
+    private static volatile Method implOnAxModeMethod;
+
     private static boolean looksLikeAxCommand(String s) {
         if (s.length() < 3) return false;
         char c0 = Character.toLowerCase(s.charAt(0));

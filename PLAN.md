@@ -174,8 +174,8 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 **Known gaps / polish that moved into later milestones:**
 - Stars/FKDR/W/L/Wins colors are only partially tiered — full color-code schema lives in M11.
 - No auto-arm fetch on game start — M10.
-- Chat target alert system for specific players — M12.
-- Cheater / client tags — M13 (Seraph API integration).
+- Chat target alert system for specific players — M14.
+- Cheater / client tags — M15 (Seraph API integration).
 - **Health indicator missing.** Vanilla tab renders each player's hearts (scoreboard-health objective, the row of red hearts next to the name) inside `renderPlayerlist`. Our early-return skips it. Re-add as a dedicated column — read the same scoreboard objective vanilla uses (`GuiPlayerTabOverlay.drawScoreboardValues` / objective slot 0) and render it as either ascii hearts or an icon column. Placement TBD; user flagged as important, so handle before or during M11.
 - **Player head icon missing.** Vanilla tab draws each player's 8×8 face on the left of the row (skin texture, bound via `AbstractClientPlayer.getLocationSkin()` → `Minecraft.getTextureManager()`; vanilla uses `Gui.drawTexturedModalRect` with UV 8,8,8,8 for the face layer and 40,8,8,8 for the hat overlay). Early-return skips this too. **Tied to the Name cell, not its own column** — draw the face to the left of the name inside whatever x-slot the `name` column occupies, and offset the name string by ~10px to make room. This way reordering columns in config keeps the head next to the name (where the user expects it), and users who drop `name` from `columns` also drop the head. Needs GL state (`GlStateManager.color`, texture bind) and the skin-texture location from NPI. Handle alongside health in M11.
 
@@ -212,22 +212,62 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 
 ---
 
-## M11 — Stat column coloring
+## M11 — Stat column coloring + per-mode config — **Done (2026-04-22).**
 
-**Goal:** All data columns get color tiers, not just stars.
+**Goal:** All data columns get color tiers (not just stars), fully user-configurable, with the config split per game mode so mode-specific settings can be swapped without touching identity settings.
 
-**Deliverable:**
-- FKDR tiers (e.g. 0-1 gray, 1-3 white, 3-5 green, 5-10 blue, 10-20 purple, 20+ gold/red).
-- W/L tiers (similar ramp).
-- Wins tiers by magnitude (thresholds at 100 / 500 / 1k / 5k / 10k / 25k).
-- Stars: extend current tier palette to full 1000+ with the rainbow treatment deferred from M6.
-- Exact thresholds TBD; match community convention (Seraph / Polsu palettes as reference).
+**What shipped:**
+- `ColorTier` primitive (`min` threshold + resolved §-code or `rainbow` flag). `parse(label, min, rawColor, issues)` factory drops bad entries into an issues list without throwing; `pick` walks tiers descending so the highest satisfied threshold wins; `colorize` applies the tier (solid §-code, or per-char cycling `§c §6 §e §a §b §d` for rainbow tiers on stars ≥ 1000). Supports MC named colors (`gray`, `light_purple`, `dark_aqua`, ...) with aliases (`grey`, `pink`) and raw §-codes.
+- **Config file split** from a single file to two:
+  - `%APPDATA%\Aurex\config.json` — identity-scoped (`apiKey`, `activeMode`, `nickDetection`, `chatAlerts`).
+  - `%APPDATA%\Aurex\modes\<mode>.json` — per-mode (`columns`, `colors`). First file shipped: `bedwars.json`.
+  - Rationale: swapping mode shouldn't churn apiKey / nick settings; promoting any field to per-mode later is a line move, not a schema migration.
+- **Self-documenting auto-generate:** on first launch the generated `modes/bedwars.json` contains a `colors` tier ladder for *every* supported column (`stars`, `fkdr`, `wl`, `wins`, `health`) even when the default `columns` array only has a subset. Users discover available columns by reading the file — no separate reference doc.
+- **Forward-compat backfill:** `ModeConfig.parse` fills in missing column tiers with built-in defaults, so adding a new stat column in a later release doesn't break existing user configs.
+- `AgentImpl.formatCell` / `formatStatsPrefix` / `formatHealth` all route through `ColorTier.colorize(cfg.colors.get(COL_X), value, text)` — one lookup path regardless of render context.
+- Default palettes (source of truth in `ModeConfig` `Object[][]` tables, used both in-memory and when serializing the default JSON):
+  - Stars per 100 prestige: gray → white → gold → aqua → dark_green → dark_aqua → dark_red → light_purple → blue → dark_purple → rainbow at 1000.
+  - FKDR: 0 gray, 1 white, 3 green, 5 blue, 10 light_purple, 20 gold, 50 red, 100 dark_red.
+  - W/L: 0 gray, 0.5 white, 1 green, 2 blue, 5 light_purple, 10 gold, 20 red.
+  - Wins: 0 gray, 100 white, 500 green, 1k blue, 5k light_purple, 10k gold, 25k red.
+  - Health: 1 red, 6 yellow, 11 dark_green.
+- `AX-mode` chat command — `AX-mode` / `AX-mode list` prints known modes with a `§a*` marker on the active one; `AX-mode <name>` validates, calls `Config.writeActiveMode` (preserves other fields in `config.json`), reloads config, and announces the switch. Parse issues from the freshly-loaded mode file flush to chat the same way `onServerJoin` handles them.
 
-**Success check:** Tab rows visibly read at a glance — a sweaty lobby pops red/gold, a casual one is gray/green.
+**Verified 2026-04-22:** default config auto-generates on first launch with all five columns tiered; stars render rainbow past 1000; FKDR/W/L/Wins pop red for sweats; `AX-mode list` correctly highlights the active mode.
 
 ---
 
-## M12 — Chat target alert system
+## M12 — Extended Bedwars stat columns
+
+**Goal:** Flesh out the Bedwars-mode column catalog beyond the M11 five so users can actually tune what they see. Every new column ships with its default color ladder in `modes/bedwars.json` so the self-documenting file stays useful.
+
+**Deliverable:**
+- Finals (total final kills), Beds (beds broken), Winstreak (current — field is API-gated per-account; graceful fallback to `—` when hidden), KDR (regular kill / death), BBLR (beds broken / lost).
+- New `Config.COL_*` constants + `ModeConfig.BW_*` default palettes + `AgentImpl.headerFor` / `formatCell` branches. One `case` per column — additive.
+- `BedwarsStats` extended with the matching fields; `HypixelClient` parses them from the same `/v2/player` payload (no extra API call).
+- Defaults NOT added to the default `columns` array — users opt in by editing `modes/bedwars.json`. They see the palette in `colors.*` even when the column isn't displayed (M11 self-documenting pattern).
+
+**Success check:** Add `"finals"` to a local `modes/bedwars.json`, `AX-mode bedwars` to hot-reload, see the finals column in tab with colored tiers.
+
+**Why here and not later:** scaling the column set after other mode-specific features (target alerts, Seraph integration) would need every added feature to retrofit per-column hooks. Landing the extended catalog now means M13+ can assume a stable column schema.
+
+---
+
+## M13 — Custom column headers
+
+**Goal:** Promote tab column headers from hardcoded strings to a user-editable map in the per-mode config, so users can rename `FKDR` → `FK/FD`, swap `✫` for `★`, or localize labels.
+
+**Deliverable:**
+- New `headers: { <colId>: <string> }` object in `modes/<mode>.json`. Ships with the current defaults (`stars → ✫`, `name → Name`, `fkdr → FKDR`, `wl → W/L`, `wins → Wins`, `health → HP` plus the M12 additions).
+- `ModeConfig.load` parses the map; unknown column ids go into `issues` and are ignored. Missing entries fall back to built-in defaults — same forward-compat pattern as `colors`.
+- `AgentImpl.headerFor(String col)` reads from the loaded config; `buildHeaders` stays unchanged.
+- Auto-generated default mode file includes a header entry for every column so the file keeps being self-documenting.
+
+**Success check:** Edit `modes/bedwars.json` to rename `FKDR` → `FK/FD`, `AX-mode bedwars` to hot-reload, see the new header in tab.
+
+---
+
+## M14 — Chat target alert system
 
 **Goal:** Call out specific players (sweats, griefers, known cheaters) in chat the moment they show up in tab.
 
@@ -241,7 +281,7 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 
 ---
 
-## M13 — Seraph API integration (cheater + client tags)
+## M15 — Seraph API integration (cheater + client tags)
 
 **Goal:** Pull community-sourced cheater + client-detection data from the Seraph backend and surface it in tab.
 
@@ -256,7 +296,7 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 
 ---
 
-## M14 — API key rotation UX
+## M16 — API key rotation UX
 
 **Goal:** Make it painless for users on Hypixel's free developer-portal keys (which rotate and can get revoked) to recover without digging in config files.
 
