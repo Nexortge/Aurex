@@ -3,6 +3,7 @@ package com.aurex.agent.api;
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -168,14 +169,22 @@ public final class SeraphClient {
 
             int code = conn.getResponseCode();
             if (code == 401 || code == 403) {
-                throw new SeraphAuthException("Seraph rejected API key (HTTP " + code + ")");
+                String body = readErrorBody(conn);
+                logger.accept("seraph: auth rejected (HTTP " + code + ")"
+                        + (body.isEmpty() ? "" : " body=" + body));
+                throw new SeraphAuthException("Seraph rejected API key (HTTP " + code + ")"
+                        + (body.isEmpty() ? "" : ": " + body));
             }
             if (code == 404) {
                 // No blacklist entry — clean player, empty tags.
                 return null;
             }
             if (code != 200) {
-                throw new IOException("HTTP " + code + " from Seraph cubelify");
+                String body = readErrorBody(conn);
+                logger.accept("seraph: non-200 (HTTP " + code + ")"
+                        + (body.isEmpty() ? "" : " body=" + body));
+                throw new IOException("HTTP " + code + " from Seraph cubelify"
+                        + (body.isEmpty() ? "" : ": " + body));
             }
 
             InputStream in = conn.getInputStream();
@@ -192,6 +201,34 @@ public final class SeraphClient {
             throw new IOException(e);
         } finally {
             if (conn != null) conn.disconnect();
+        }
+    }
+
+    /**
+     * Slurp the error-stream body (truncated) for logging. Best-effort — any
+     * failure returns empty string. Truncated to 200 chars so a giant error
+     * page can't bloat agent.log.
+     */
+    private static String readErrorBody(HttpURLConnection conn) {
+        InputStream err = conn.getErrorStream();
+        if (err == null) return "";
+        try {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            byte[] buf = new byte[512];
+            int total = 0;
+            int n;
+            while (total < 1024 && (n = err.read(buf)) != -1) {
+                baos.write(buf, 0, n);
+                total += n;
+            }
+            String s = new String(baos.toByteArray(), StandardCharsets.UTF_8)
+                    .replace('\n', ' ').replace('\r', ' ').trim();
+            if (s.length() > 200) s = s.substring(0, 197) + "...";
+            return s;
+        } catch (IOException e) {
+            return "";
+        } finally {
+            try { err.close(); } catch (IOException ignored) {}
         }
     }
 

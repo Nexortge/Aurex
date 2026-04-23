@@ -248,6 +248,37 @@ public final class Config {
     }
 
     /**
+     * Update {@code apiKey} (Hypixel) in {@code config.json} without clobbering
+     * other fields. Called from the {@code AX-hypixel <key>} chat command.
+     * Accepts empty string to clear.
+     *
+     * <p>Returns {@code true} on success; {@code false} on any I/O or parse
+     * failure (caller surfaces the error in chat).
+     */
+    public static boolean writeApiKey(String key) {
+        String normalized = key == null ? "" : key.trim();
+        Path path = resolveConfigPath();
+        if (path == null) return false;
+        try {
+            if (path.getParent() != null) Files.createDirectories(path.getParent());
+            JsonObject root = null;
+            if (Files.exists(path)) {
+                try (Reader r = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+                    JsonElement el = JsonParser.parseReader(r);
+                    if (el != null && el.isJsonObject()) root = el.getAsJsonObject();
+                }
+            }
+            if (root == null) root = buildDefaultGlobalJson();
+            root.addProperty("apiKey", normalized);
+            String pretty = new GsonBuilder().setPrettyPrinting().create().toJson(root);
+            Files.write(path, pretty.getBytes(StandardCharsets.UTF_8));
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
      * Update {@code seraphApiKey} in {@code config.json} without clobbering
      * other fields. Called from the {@code AX-seraph <key>} chat command.
      * Accepts empty string to clear.

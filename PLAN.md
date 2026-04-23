@@ -312,23 +312,27 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 
 ---
 
-## M16 — API key rotation UX
+## M16 — API key rotation UX — **Done (2026-04-23).**
 
-**Goal:** Make it painless for users on Hypixel's free developer-portal keys (which rotate and can get revoked) to recover without digging in config files.
+**Goal:** Make it painless for users on Hypixel's free developer-portal keys (which rotate and can get revoked) to recover without digging in config files. Parity with M15's Seraph rotation UX.
 
-**Why:** Most users can't get a stable production key — they pull a temp key from `developer.hypixel.net` that gets invalidated periodically. Right now we detect startup-time misconfig in `Config` / the CLI test harness, but once Lunar is running a revoked key just produces silent 403s and empty stats with no clue why.
+**What shipped:**
+- `HypixelAuthException` — typed `IOException` thrown by `HypixelClient` on HTTP 401/403. Preserved through the `supplyAsync` → `CompletionException` wrap so `StatsCache`'s cause-chain walk (4 layers) still sees it.
+- `StatsCache.authFailed()` — sticky session-life latch mirroring `SeraphCache`. First auth failure anywhere in a cached future flips the flag; subsequent `get()` calls short-circuit to `null` so a bad key can't machine-gun `/v2/player` on every tab render. Rebuilt in place on rotation — the new cache starts with a clean latch.
+- `Config.writeApiKey(String)` — merge-write parallel to `writeSeraphApiKey`, preserves other global-config fields.
+- **Launch-time probe:** `AgentImpl.initStatsCache(true)` fires one `statsCache.get(PROBE_UUID)` right after the cache is built (PROBE_UUID = `534de97c-ada7-4a67-b2a4-10fd6dbb9012`, arbitrary valid UUID — Hypixel auth checks the key before touching the UUID, so any well-formed UUID works). Result is logged via the existing `HypixelClient` logger; auth failure latches `StatsCache.authFailed` before the user ever opens tab.
+- **Post-rotation probe with chat feedback:** the hot-swap path (`rebuildHypixelPipeline`) fires the same probe with a `whenComplete` callback that chats the outcome — green "key works" on success, red "key rejected" on 401/403 (and pre-fires `hypixelAuthWarningFired` so the render-path warning stays silent), yellow "couldn't verify (network?)" on anything else. No blocking — user sees "Hypixel key updated — probing..." immediately and the outcome line when the response lands.
+- `AX-hypixel <key>` chat command — parses a length-10 prefix, bridges to `AgentImpl.onAxHypixel` via the same reflective pattern as `AX-seraph`. Key is validated non-empty, persisted via `Config.writeApiKey`, config reloaded, pipeline rebuilt, probe fired. Raw key never written to `agent.log` — only `length=N` fingerprint.
+- `maybeFireHypixelAuthWarning()` — one-shot red chat line (`§c[AX] Hypixel API key rejected — run AX-hypixel <key> to update`) fired from `getTabData` the first tab render after `StatsCache.authFailed()` flips true. Dedup'd via `hypixelAuthWarningFired`; reset on rotation.
+- `onServerJoin` hot-swap: if `apiKey` changed between reloads (e.g. user edited `config.json` directly), the pipeline rebuilds in place rather than showing the old M9 "restart Lunar to apply" warning. That warning is removed.
+- `AX-status` readout gains a `hypixel=on/off` leg (mirrors the existing `seraph=` leg).
+- `AX-help` gains an `AX-hypixel` line.
+- `AX-check <name>` output distinguishes the auth-failed state from "no key" (red `auth failed (run AX-hypixel <newkey>)` vs grey `disabled (no key)`).
+- **Response-body logging on non-2xx** — both `HypixelClient` and `SeraphClient` now slurp the error stream (truncated to 200 chars, single-lined, UTF-8) and log the body alongside the status code. Landed as part of M16 because debugging "why is my key rejected" is the main use case, but it also helps diagnose 429 rate-limit cliffs and 5xx outages going forward.
 
-**Deliverable:**
-- Detect auth failure in `HypixelClient` — HTTP 401/403 from `/v2/player`. On first occurrence per session, post a red chat line: `§c[AX] API key rejected. Get a new one at https://developer.hypixel.net and run AX-key <key>`. Dedup so it fires once per session, not per player lookup.
-- `AX-key <key>` chat command added to the existing `ChatCommandTransformer` / `Agent.onOutgoingChat` parser:
-  - Validates the argument is UUID-shaped (8-4-4-4-12 hex).
-  - Writes it to `%APPDATA%\Aurex\config.json` (merging, not clobbering — preserve columns / nickDetection / chatAlerts).
-  - **Hot-swap** the running `HypixelClient` / `StatsCache`. Currently M9 notes that apiKey mid-session changes can't take effect and we show a "restart Lunar to apply" warning — M14 makes them hot-swappable. Drop the cache too, since old 403s are stuck as failed futures.
-  - Confirm in chat: `§a[AX] API key updated. Retry a tab open.`
-  - **Security:** the command is swallowed client-side (same as AX-on etc.), so the key never goes to Hypixel chat. But it's still plaintext in the local log — scrub `AX-key` lines from the log write, or just don't log the command body at all.
-- Remove the M9 "restart Lunar to apply" warning once hot-swap works.
-
-**Success check:** Pull a working key, let it get rotated / revoke it manually in the dev portal, queue a game — see the red warning with link, run `AX-key <newkey>`, see confirmation, tab stats resume working without restarting Lunar.
+**Not shipped (deferred):**
+- UUID-shape validation on `AX-hypixel <key>`. The plan originally called for `isUuidShaped` validation, but the PROBE now rejects bad keys with a clear chat line anyway, so pre-validating would only add a second error surface.
+- Startup-probe re-run on network reconnect. If the initial probe fails with a transport error (not auth), the latch stays clear and real tab-render lookups will re-try organically as the user queues games.
 
 ---
 
@@ -412,12 +416,124 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 
 ---
 
+## M18 — Friend-group whitelist (UUID gate)
+
+**Goal:** Keep Aurex inside the intended friend group without a per-user licensing rig. On startup the agent fetches a UUID whitelist from a URL the owner controls; accounts not on the list fall into a dormant mode (no tab hook, no chat commands, no network traffic beyond the whitelist fetch itself).
+
+**Why now (before the installer):** if we ship an installer first, revocation becomes awkward — friends who shouldn't have it anymore keep a working copy. Building the gate first means the installer's first real action is "check whether you're allowed," and revocation is just "edit the JSON."
+
+**Threat model — explicit:** the goal is "stop casual resharing," NOT "stop a determined reverser." The repo is public-ish (or at least we're writing under that assumption) and rebuilding from source bypasses this completely. That's fine. If someone spends an afternoon patching the jar, they were going to get it anyway.
+
+**Deliverable:**
+- Owner hosts a JSON file at a stable URL (GitHub Gist raw URL is the path of least resistance). Shape: `{"allowed":["<mojang-uuid>", ...], "revoked":["<uuid>"]}`. Undashed hex, lowercase. `revoked` is an optional explicit-deny list so "remove from allowed" and "actively revoked" aren't the same state (useful for "I'll let you back in later" moments).
+- Whitelist URL is a build-time constant baked into `agent/src/main/java/com/aurex/agent/access/Whitelist.java`. Change it = rebuild. That's intentional — the URL is the trust root.
+- **Check runs on `onServerJoin`, not premain.** Lunar lets users switch Minecraft accounts mid-session without a relaunch — a startup-only check would miss a post-launch account swap and keep the agent active on an unauthorized UUID. By gating at world-join we re-read the current UUID every time the user enters a world (lobby, sub-server hop, reconnect) and can flip dormant on/off as the active account changes. Cost: nothing — `onServerJoin` already exists (M10/M14) and runs off the render thread.
+- `Whitelist.check(UUID currentPlayerUuid)` called from the top of `AgentImpl.onServerJoin`, before the existing config-reload path:
+  1. Reads the current UUID from `Minecraft.thePlayer.getUniqueID()` (reflective; we're on bootstrap). This is the authoritative source — it's the UUID Hypixel actually sees.
+  2. If verdict for this UUID is already cached in-memory for this session, use it — no refetch on every lobby hop.
+  3. Otherwise fetch whitelist JSON (5s connect / 10s read). On success, updates both in-memory and `%APPDATA%\Aurex\whitelist-cache.json` with fetch timestamp.
+  4. On network failure, falls back to the cached file if <7 days old; older than that → treated as "no verdict"; see below.
+  5. Verdict logic: UUID in `revoked` → **deny**. UUID in `allowed` → **allow**. Neither → **deny** (default-deny; "no verdict" above also becomes deny).
+- **Dormant flag is UUID-scoped and re-evaluated each world-join** — so the user who launches on an authorized main and switches to an unauthorized alt gets shut down on the next world-join (lobby re-enter = <1s in practice, since Lunar re-joins the hub). Switching back flips it back on without a relaunch.
+- **Deny path:** agent logs `access: not whitelisted for uuid=<short>`, sends one red chat line on world-join (`§c[AX] This build is not authorized for your account — contact the owner`), and sets the dormant flag. All subsequent hooks (tab render, chat command parser, incoming-chat auto-arm) check the flag at their entrypoint and no-op. **The jar stays loaded** — we can't `System.exit` from inside Lunar's JVM without taking Lunar down — we just render nothing. One deny-line per UUID per session to avoid spam on lobby hops.
+- **Race at world-load:** the first world-join fires before `Minecraft.thePlayer` is fully populated in some edge cases (reconnect-during-disconnect). If `thePlayer` is null or its UUID is zero, treat as "unknown → dormant but silent" (no chat line, no log spam) and retry on the next world-join tick. Should self-correct within one lobby hop.
+- **Alt accounts** require separate enrollment: each alt's UUID DM'd to the owner and added to `allowed`. Documented in the install README.
+- **Cache staleness policy:** <1 day old → silent use, no network retry. 1–7 days → use, plus one background refresh attempt per session. >7 days → treat as no-verdict (deny) and retry the fetch on each world-join until it succeeds.
+- **Manual refresh:** new `AX-whitelist-refresh` chat command forces a fresh fetch + re-evaluate. Useful when the owner just added you and you don't want to wait for the cache to expire or re-lobby.
+- `agent.log` breadcrumbs: one line per verdict change — `access: uuid=<short> verdict=<allow|deny> source=<network|cache|cache-stale>`. Same UUID on repeat joins is silent. Raw UUID in logs, not in chat.
+- **No new UI inside Aurex** beyond the one deny chat line + the refresh command. No self-service — owner is the only gatekeeper.
+
+**Out of scope / deferred:**
+- Code signing / real license server.
+- Encrypted jar payload / obfuscation.
+- Self-service enrollment (the owner is the only gatekeeper).
+- Any in-game UX beyond the one red line on deny.
+
+**Success check:** launch Lunar on an account NOT on the whitelist, join a lobby → agent logs deny, red chat line appears once, tab is vanilla, AX-* commands no-op. Launch on an account ON the whitelist → unchanged from today. **Mid-session account switch test:** launch on allowed account → switch to unauthorized account in Lunar → join a lobby → deny fires on this world-join. Switch back → next world-join re-enables. Remove a UUID from the gist, run `AX-whitelist-refresh` on that account → deny fires within the same session without a relaunch.
+
+---
+
+## M19 — PowerShell installer
+
+**Goal:** One-liner install for friends who don't want to touch Gradle, Java paths, or Lunar's settings JSON. The installer runs on Windows only (Lunar support target is Windows per CLAUDE.md) and does the setup that's currently a per-user README dance.
+
+**Deliverable — `install.ps1` shipped alongside the release jar:**
+1. **Pre-flight checks:**
+   - Windows only; bails with a friendly error otherwise.
+   - Detects Lunar at `%LOCALAPPDATA%\Programs\Lunar Client\` (or the per-user registry key Lunar sets on install). Bails with install instructions if missing.
+   - Reads Lunar's accounts file (`%USERPROFILE%\.lunarclient\settings\game\accounts.json` — path confirmed at M18 implementation time) and checks every profile's UUID against the M18 whitelist URL. **Advisory, not blocking** — the gate itself runs at world-join (M18), so we don't need the installer to enforce. But we DO want to print: "your UUIDs: `<main>`, `<alt1>`, …; of these, `<main>` is authorized, `<alt1>` is not. DM the owner the UUIDs you want enrolled." Means users know exactly what to send instead of guessing or copy-pasting from Mojang.
+2. **Jar deployment:**
+   - Copies the jar from next to the script to `%APPDATA%\Aurex\aurex-agent.jar`. Overwrites cleanly on reinstall/update.
+3. **Lunar JVM-args patch:**
+   - Lunar stores user JVM args in a settings JSON under `%USERPROFILE%\.lunarclient\settings\` (exact file name needs confirming at implementation time — candidates include `settings.json`, `game/<version>.json`, or a top-level account file). Script reads the existing JSON, appends the `-javaagent:` line to whatever JVM-args field Lunar uses (string or array, depending on schema), preserving all other args. Deduplicates: if an existing `-javaagent:<anything>\aurex-agent.jar` is present, replaces it with the new path rather than appending a second one.
+   - Writes the file back atomically (temp file + rename) so a crash mid-write doesn't brick Lunar's settings.
+4. **Config scaffolding:**
+   - Creates `%APPDATA%\Aurex\` if missing.
+   - Prompts (with defaults) for `apiKey` (Hypixel) and `seraphApiKey`. Either can be skipped with Enter — sets that key to empty string; the agent runs fine without Seraph, and the user can set the Hypixel key later via `AX-hypixel <key>`.
+   - Writes `config.json` with the keys, default `activeMode=bedwars`, and the rest of the defaults the agent would generate on first launch anyway.
+   - Skips if `config.json` already exists — don't overwrite an existing install's keys.
+5. **Completion output:**
+   - Prints: installed jar path, patched settings file path, next steps ("launch Lunar 1.8.9, open tab in a Bedwars lobby"). Also prints the uninstall command.
+
+**Uninstall mode — `install.ps1 -Uninstall`:** removes the `-javaagent:` line from Lunar's settings JSON, deletes `%APPDATA%\Aurex\aurex-agent.jar`. Leaves `config.json` and `modes/` in place (user may want to preserve their keys/setup across reinstalls; a `-Purge` flag removes those too).
+
+**Release mechanics (out of scope but worth noting):**
+- GitHub Release bundles `install.ps1` + `aurex-agent.jar`.
+- One-line install becomes `irm <release-url>/install.ps1 | iex` once we're comfortable with the security posture (arbitrary remote-execute-from-shell). For 0.1-share it's probably "download the release zip, right-click install.ps1 → Run with PowerShell."
+
+**Out of scope / deferred:**
+- Mac / Linux installers.
+- Auto-update — the jar doesn't check for new releases. Owner DMs "rerun the installer" when there's a new build.
+- GUI installer.
+- Registry uninstall entry (Add/Remove Programs).
+
+**Success check:** fresh Windows user with Lunar already installed, never touched Aurex, runs `install.ps1`, provides their Hypixel key at the prompt, closes PowerShell, launches Lunar 1.8.9, queues Bedwars, opens tab → sees the Aurex stats table. `install.ps1 -Uninstall` cleanly removes the `-javaagent:` line and the jar; Lunar launches in vanilla mode next time.
+
+---
+
+## M20 — SkyWars + Duels modes (with per-variant Duels split)
+
+**Goal:** Extend the column catalog past Bedwars so friends who queue SkyWars or Duels see stats. Duels splits per game variant (UHC / SW / Classic / Bow / etc.) because thresholds and relevant columns diverge sharply between variants — a 5.0 UHC duels WLR is absurd, a 5.0 classic WLR is Tuesday.
+
+**Why this slot:** the mode-config system (M11/M12/M13) was built to make this additive. Every new mode is a new `<mode>.json` + POJO + parser + `formatCell` branches, no architectural changes. Landing it after the install gate + installer means a new friend's first experience covers all the modes they actually play, not just Bedwars.
+
+**Mode detection stays manual.** Users run `AX-mode skywars` before queueing SkyWars. Locraw-based auto-detection is still post-V1 territory — interesting but a separate project.
+
+**Deliverable — SkyWars:**
+- New `SkyWarsStats` POJO + `HypixelClient` parse path for the `player.stats.SkyWars` subtree. Fields: `level` (derived from `skywars_experience`), `kills`, `deaths`, `kdr`, `wins`, `losses`, `wlr`, `winstreak` (top-level or per-mode?), optional `souls_gathered`.
+- `Config.COL_SW_LEVEL`, `COL_SW_KDR`, `COL_SW_WLR`, `COL_SW_WINS`, `COL_SW_KILLS` (plus any others we settle on at implementation time).
+- `ModeConfig.MODE_SKYWARS = "skywars"` + `MODES` entry with default `columns`, `colors` (tier ladders per column), `headers`, `alerts` thresholds. Ships as an auto-generated `modes/skywars.json` on first `AX-mode skywars`.
+- `AgentImpl.formatCell` branches for each new column, plus the `getTabData` / `buildRawRow` paths: the existing `BedwarsStats` reference in `RawRow` generalizes to a `ModeStats` interface or a pair of nullable fields (`BedwarsStats` + `SkyWarsStats`); pick whichever is less invasive at implementation time.
+
+**Deliverable — Duels:**
+- `DuelsStats` POJO parses the `player.stats.Duels` subtree. That subtree is one blob per variant — `classic_duel_wins`, `classic_duel_kills`, `uhc_duel_wins`, `uhc_duel_kills`, `sw_duel_wins`, etc. — so one parser populates nested maps keyed by variant.
+- Variants targeted for 0.1: **classic, uhc, sw (SkyWars duel), bow, sumo.** Blitz / MegaWalls / OP / boxing added later if anyone plays them.
+- One mode file per variant: `modes/classic_duel.json`, `modes/uhc_duel.json`, `modes/sw_duel.json`, `modes/bow_duel.json`, `modes/sumo_duel.json`. Each references only the columns relevant to that variant (UHC duels care about HP / final-round damage; bow duels care about accuracy; sumo cares about… basically just WLR and kills).
+- Shared base stats across all Duels variants: overall `coins`, `current_winstreak`, `best_winstreak`, `games_played`. These are `player.stats.Duels` top-level, not per-variant.
+- `AX-mode uhc_duel` / `AX-mode classic_duel` / etc. as the switching UX. Names are long-ish; that's intentional — `AX-mode uhc` would be ambiguous if we ever add UHC the main mode.
+
+**Shared infrastructure changes:**
+- `Config.VALID_COLUMNS` expands with the new SW_* + DUELS_* columns.
+- `AgentImpl.formatHypixelLines` (AX-check) needs a mode-aware branch — "hypixel: no Bedwars data" is wrong when the user is checking a SkyWars-only player.
+- Threat report (M14) becomes per-mode — uhc_duel threshold ≠ bedwars threshold. `ModeConfig.alerts` already supports this.
+
+**Out of scope / deferred:**
+- Auto-mode-detection via locraw/scoreboard.
+- Blitz, MegaWalls, UHC (main), Arena, TNT Games, Cops & Crims, Arcade.
+- Per-map Duels stats (some variants track per-map winrates — ignore).
+- Live-game scoreboard integration (kills this round, etc.) — separate project.
+
+**Success check:** friend who plays SkyWars runs `AX-mode skywars`, queues, opens tab → sees level / KDR / WLR / wins / kills with the right color tiers. Friend who plays UHC duels runs `AX-mode uhc_duel`, queues → sees UHC-specific columns. `AX-check <name>` renders the block for whichever mode is active.
+
+---
+
 ## Post-V1 (not scheduled)
 
 - Game-mode detection (read Hypixel locraw / scoreboard → know if we're in Bedwars vs SkyWars vs lobby)
-- Stats for other modes (SkyWars, Duels, etc.) — the extensible stats layer from M5 should make this additive
+- Additional modes beyond M20's scope (Blitz, MegaWalls, UHC, Arena, Arcade, etc.)
 - GUI config screen (vs JSON file)
 - Auto-update check
+- Live in-game scoreboard integration (round-by-round kills, damage, etc.)
 
 ---
 

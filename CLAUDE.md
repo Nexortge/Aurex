@@ -38,6 +38,7 @@ A Seraph-style stat overlay **injected into Lunar Client** (Minecraft 1.8.9) tha
 - `AX-mode` / `AX-mode list` — list known modes (active one marked with `§a*`).
 - `AX-mode <name>` — persist `activeMode` to `config.json` and hot-reload. Auto-generates `modes/<name>.json` with defaults if missing.
 - `AX-ignore <name>` / `AX-removeignore <name>` — add/remove a username from `ignoreList`. Ignored players (and their scoreboard team) are excluded from the M14 game-start threat report — typically your own alts.
+- `AX-hypixel <key>` — rotate the Hypixel API key. Persists to `config.json`, hot-swaps the running `StatsCache` / `HypixelClient` without a restart, and fires a validation probe that reports pass/fail in chat. Raw key is never logged.
 - `AX-seraph <key>` — rotate the Seraph API key. Persists to `config.json`, hot-swaps the running `SeraphCache` without a restart. Raw key is never logged.
 - `AX-check <name>` — debug: Mojang username → UUID, fires Hypixel + Seraph lookups for that UUID, dumps the results in client chat. Bypasses arm/display gates so it works any time. Useful for verifying integration without queueing into a lobby.
 

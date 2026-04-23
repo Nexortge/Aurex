@@ -25,6 +25,14 @@ import java.util.concurrent.TimeUnit;
  * is no instance lock. Safe to read from any thread including the render
  * thread (because reads are non-blocking and {@code get(uuid)} only returns
  * the future, not its result).
+ *
+ * <p><b>authFailed flag.</b> On the first {@link HypixelAuthException}
+ * propagated through any cached future, {@link #authFailed()} flips true and
+ * stays true for the life of the cache. {@link #get} returns {@code null}
+ * once latched — a stuck 403 would otherwise machine-gun Hypixel every tab
+ * render. {@code AgentImpl} uses this to fire a one-shot red chat warning
+ * and then go silent until the user runs {@code AX-hypixel <newkey>}, which
+ * rebuilds the cache (swapping in a fresh latch).
  */
 public final class StatsCache {
 
@@ -33,6 +41,7 @@ public final class StatsCache {
     private final HypixelClient client;
     private final long ttlNs;
     private final ConcurrentHashMap<UUID, Entry> entries = new ConcurrentHashMap<>();
+    private volatile boolean authFailed = false;
 
     public StatsCache(HypixelClient client) {
         this(client, DEFAULT_TTL_NS);
@@ -49,8 +58,13 @@ public final class StatsCache {
      * <p>First call for a fresh UUID kicks off a fetch. Subsequent calls return
      * the same future until it ages past the TTL, at which point the next call
      * starts a fresh fetch.
+     *
+     * <p>Returns {@code null} if {@link #authFailed()} is true — callers should
+     * not trigger more fetches once the session key is known bad. The render
+     * path treats a {@code null} here the same as a cache miss with fetch idle.
      */
     public CompletableFuture<BedwarsStats> get(UUID uuid) {
+        if (authFailed) return null;
         long now = System.nanoTime();
         while (true) {
             Entry existing = entries.get(uuid);
@@ -59,6 +73,14 @@ public final class StatsCache {
             }
             // Expired or absent -> start a new fetch.
             CompletableFuture<BedwarsStats> fresh = client.fetch(uuid);
+            // Hook a terminal check so the first auth failure anywhere flips
+            // the session flag without the caller needing to inspect every
+            // future.
+            fresh.whenComplete((data, err) -> {
+                if (err != null && isAuthFailure(err)) {
+                    authFailed = true;
+                }
+            });
             Entry candidate = new Entry(fresh, now);
             Entry prev;
             if (existing == null) {
@@ -100,6 +122,26 @@ public final class StatsCache {
 
     public int size() {
         return entries.size();
+    }
+
+    /** True if any cached fetch failed with auth rejection. Sticky for session life. */
+    public boolean authFailed() {
+        return authFailed;
+    }
+
+    /**
+     * Unwrap {@code whenComplete}'s supplied throwable (which is typically a
+     * {@code CompletionException} wrapping the real cause) and check for
+     * {@link HypixelAuthException}. Walks cause chain up to 4 layers because
+     * {@link HypixelClient} re-wraps IOException in RuntimeException via
+     * {@code supplyAsync}.
+     */
+    private static boolean isAuthFailure(Throwable t) {
+        for (int i = 0; i < 4 && t != null; i++) {
+            if (t instanceof HypixelAuthException) return true;
+            t = t.getCause();
+        }
+        return false;
     }
 
     private boolean isExpired(Entry e, long nowNs) {

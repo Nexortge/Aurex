@@ -73,17 +73,37 @@ public final class AgentImpl {
     private static volatile Config config = Config.load();
 
     /**
-     * Initial API key at startup. Used by {@link #onServerJoin()} to detect
-     * when the user has changed {@code apiKey} mid-session — we can't swap
-     * out the running {@link HypixelClient}, so we warn and tell them to restart.
+     * Well-formed UUID we hit on startup + after every AX-hypixel rotation to
+     * probe key validity. Hypixel validates the key before doing any UUID
+     * lookup, so any valid UUID shape works — this one is arbitrary (chosen
+     * once and hardcoded so users can correlate probe calls in their logs to
+     * a stable breadcrumb).
+     *
+     * <p><b>Declared before {@link #statsCache} on purpose</b> — the static
+     * initializer for {@code statsCache} kicks off the startup probe, which
+     * reads this field synchronously. Java initializes static fields in source
+     * order, so a later declaration would be {@code null} at probe time and
+     * {@code ConcurrentHashMap.get(null)} throws NPE.
      */
-    private static final String initialApiKey = config.apiKey;
+    private static final UUID PROBE_UUID = UUID.fromString("534de97c-ada7-4a67-b2a4-10fd6dbb9012");
 
     /**
-     * The singleton stats pipeline. {@code null} if no API key is configured —
-     * in that case decoration is a no-op and Aurex runs silently.
+     * The Hypixel stats pipeline. {@code null} if no API key is configured —
+     * in that case decoration is a no-op and Aurex runs silently. Non-final
+     * because {@link #rebuildHypixelPipeline} swaps it when the user runs
+     * {@code AX-hypixel <newkey>} (M16) or when {@link #onServerJoin} sees the
+     * key changed in config.json.
      */
-    private static final StatsCache statsCache = initStatsCache();
+    private static volatile StatsCache statsCache = initStatsCache(true);
+
+    /**
+     * One-shot per session: flips true the first time we emit the red
+     * "Hypixel API key rejected" chat warning. Prevents repeating the warning
+     * every tab render when {@link StatsCache#authFailed()} is sticky-true.
+     * Reset by {@link #rebuildHypixelPipeline} so a fresh 403 post-rotation
+     * can re-raise.
+     */
+    private static volatile boolean hypixelAuthWarningFired = false;
 
     /**
      * M15 Seraph pipeline. {@code null} until a {@code seraphApiKey} is
@@ -173,7 +193,18 @@ public final class AgentImpl {
 
     private AgentImpl() {}
 
-    private static StatsCache initStatsCache() {
+    /**
+     * Build a fresh {@link StatsCache} from the current {@link #config}'s
+     * {@code apiKey}. Returns {@code null} when no key is configured.
+     *
+     * <p>When {@code fireProbe} is true, kicks off a silent startup probe (one
+     * fetch against {@link #PROBE_UUID}) so the {@link StatsCache#authFailed()}
+     * latch flips early if the key is bad — means the first tab render can
+     * already post the red warning instead of waiting for a real lookup.
+     * Set false when the caller wants to drive the probe themselves (e.g. the
+     * hot-swap path wants to chat the result).
+     */
+    private static StatsCache initStatsCache(boolean fireProbe) {
         try {
             for (String issue : config.issues) {
                 Agent.log("config: " + issue);
@@ -186,10 +217,97 @@ public final class AgentImpl {
             Agent.log("stats: API key loaded; pipeline ready (mode=" + config.activeMode
                     + " columns=" + config.columns
                     + " nicks=" + config.nickDetection + " alerts=" + config.chatAlerts + ")");
-            return new StatsCache(new HypixelClient(key, Agent::log));
+            StatsCache sc = new StatsCache(new HypixelClient(key, Agent::log));
+            if (fireProbe) fireHypixelProbe(sc, null);
+            return sc;
         } catch (Throwable t) {
             Agent.log("stats: init failed, running without stats: " + t);
             return null;
+        }
+    }
+
+    /**
+     * Rebuild the Hypixel pipeline after a config reload or {@code AX-hypixel}
+     * rotation. Resets the auth-warning latch + nick-alert dedup so a fresh
+     * key can re-raise warnings / re-announce nicks; probes the new key
+     * immediately. {@code mcLoader} non-null triggers the chat-result path
+     * (green/yellow/red line on probe outcome); null skips it for silent
+     * reloads.
+     */
+    private static void rebuildHypixelPipeline(ClassLoader mcLoader) {
+        StatsCache fresh = initStatsCache(false);
+        statsCache = fresh;
+        hypixelAuthWarningFired = false;
+        alertedNicks.clear();
+        if (fresh != null) {
+            fireHypixelProbe(fresh, mcLoader);
+        } else if (mcLoader != null) {
+            Agent.sendClientChat(Agent.PREFIX + "§cno Hypixel key set — stats disabled", mcLoader);
+        }
+        Agent.log("hypixel: pipeline reinitialised (key="
+                + (config.apiKey == null ? "unset" : "set") + ")");
+    }
+
+    /**
+     * Fire a single fetch against {@link #PROBE_UUID} to validate the current
+     * key. On completion:
+     * <ul>
+     *   <li>auth failure → chat (if {@code mcLoader} non-null) and pre-fire
+     *       the one-shot warning latch so the render path stays silent</li>
+     *   <li>other error → yellow "couldn't verify" chat line (network?)</li>
+     *   <li>success → green "key works" confirmation</li>
+     * </ul>
+     *
+     * <p>Safe from any thread — callback runs on whichever thread completed
+     * the future. Never throws; a callback exception is logged.
+     */
+    private static void fireHypixelProbe(StatsCache sc, ClassLoader mcLoader) {
+        try {
+            if (sc == null) return;
+            CompletableFuture<BedwarsStats> fut = sc.get(PROBE_UUID);
+            if (fut == null) {
+                // sc.get() only returns null when authFailed is already latched —
+                // can't happen on a freshly-built cache, but defensive.
+                if (mcLoader != null) {
+                    Agent.sendClientChat(Agent.PREFIX + "§cHypixel API key already rejected",
+                            mcLoader);
+                }
+                return;
+            }
+            Agent.log("hypixel: probe started (uuid=" + PROBE_UUID + ")");
+            fut.whenComplete((stats, err) -> {
+                try {
+                    StatsCache current = statsCache;
+                    if (current != null && current.authFailed()) {
+                        Agent.log("hypixel: probe -> auth failed");
+                        if (mcLoader != null) {
+                            Agent.sendClientChat(Agent.PREFIX
+                                    + "§cHypixel API key rejected — run AX-hypixel <newkey>",
+                                    mcLoader);
+                            hypixelAuthWarningFired = true;  // suppress render-path repeat
+                        }
+                        return;
+                    }
+                    if (err != null) {
+                        Throwable cause = err.getCause() != null ? err.getCause() : err;
+                        Agent.log("hypixel: probe -> non-auth failure: " + cause);
+                        if (mcLoader != null) {
+                            Agent.sendClientChat(Agent.PREFIX
+                                    + "§ecouldn't verify key (network?): " + cause,
+                                    mcLoader);
+                        }
+                        return;
+                    }
+                    Agent.log("hypixel: probe -> OK");
+                    if (mcLoader != null) {
+                        Agent.sendClientChat(Agent.PREFIX + "§aHypixel key works", mcLoader);
+                    }
+                } catch (Throwable t) {
+                    Agent.log("hypixel probe callback failed: " + t);
+                }
+            });
+        } catch (Throwable t) {
+            Agent.log("fireHypixelProbe failed: " + t);
         }
     }
 
@@ -234,20 +352,22 @@ public final class AgentImpl {
      *
      * <p><b>Chat policy:</b> silent on success. Only posts in-game when
      * something needs user attention — parse issues (unknown columns etc.) or
-     * an apiKey change that needs a restart. Successful reloads go to the log
-     * only. Rationale: Hypixel Bungee fires handleJoinGame on every
-     * lobby/sub-server hop; a success line per hop would be spam, but a warning
-     * per hop while the user fixes their config is actually useful.
+     * an apiKey change (which triggers a pipeline hot-swap). Successful
+     * reloads go to the log only. Rationale: Hypixel Bungee fires handleJoinGame
+     * on every lobby/sub-server hop; a success line per hop would be spam,
+     * but a warning per hop while the user fixes their config is actually useful.
      *
-     * <p>API key changes can't take effect mid-session (the {@link HypixelClient}
-     * + {@link StatsCache} are bound to the startup key), so we detect and
-     * warn if {@code apiKey} differs from startup.
+     * <p>If {@code apiKey} changes between reloads (e.g. the user edited
+     * config.json directly instead of running {@code AX-hypixel <key>}), the
+     * Hypixel pipeline is rebuilt in place so the new key takes effect without
+     * a restart. Same hot-swap path as {@link #onAxHypixel}.
      *
      * <p>Never throws — runs off the render thread but still safety-wrapped so
      * a malformed config can't break world-load.
      */
     public static void onServerJoin() {
         try {
+            String oldKey = config.apiKey;
             Config fresh = Config.load();
             config = fresh;
 
@@ -262,13 +382,14 @@ public final class AgentImpl {
                 Agent.sendClientChat(Agent.PREFIX + "§econfig: " + issue, capturedMcLoader);
             }
 
-            boolean keyChanged = initialApiKey == null
+            boolean keyChanged = oldKey == null
                     ? fresh.apiKey != null
-                    : !initialApiKey.equals(fresh.apiKey);
+                    : !oldKey.equals(fresh.apiKey);
             if (keyChanged) {
-                Agent.sendClientChat(Agent.PREFIX + "§capiKey changed — restart Lunar to apply",
+                Agent.log("config: apiKey changed — rebuilding Hypixel pipeline");
+                Agent.sendClientChat(Agent.PREFIX + "§aapiKey changed in config — reloading",
                         capturedMcLoader);
-                Agent.log("config: apiKey changed since startup — restart required");
+                rebuildHypixelPipeline(capturedMcLoader);
             }
         } catch (Throwable t) {
             Agent.log("onServerJoin failed: " + t);
@@ -579,12 +700,58 @@ public final class AgentImpl {
     }
 
     /**
+     * Handle {@code AX-hypixel <key>} from chat. Parallel to {@link #onAxSeraph}:
+     * persists via {@link Config#writeApiKey}, reloads config, rebuilds the
+     * Hypixel {@link StatsCache} / {@link HypixelClient} in place via
+     * {@link #rebuildHypixelPipeline}, which kicks off a validation probe and
+     * posts the result as green / yellow / red chat.
+     *
+     * <p><b>Log scrubbing:</b> the raw key never touches {@code agent.log} —
+     * only its length fingerprints in the outcome line.
+     */
+    public static void onAxHypixel(String rest) {
+        try {
+            adoptChatThreadMcLoader();
+            if (rest == null || rest.isEmpty()) {
+                Agent.sendClientChat(Agent.PREFIX + "§eusage: AX-hypixel <key>",
+                        capturedMcLoader);
+                return;
+            }
+            String key = rest.trim();
+            if (!Config.writeApiKey(key)) {
+                Agent.sendClientChat(Agent.PREFIX + "§ccould not write config.json — check log",
+                        capturedMcLoader);
+                Agent.log("AX-hypixel: writeApiKey failed (key length=" + key.length() + ")");
+                return;
+            }
+            Config fresh = Config.load();
+            config = fresh;
+            Agent.sendClientChat(Agent.PREFIX + "§eHypixel key updated — probing...",
+                    capturedMcLoader);
+            Agent.log("AX-hypixel: key updated (length=" + key.length() + ")");
+            rebuildHypixelPipeline(capturedMcLoader);
+        } catch (Throwable t) {
+            Agent.log("onAxHypixel failed: " + t);
+        }
+    }
+
+    /**
      * Agent-facing query for {@code AX-status} — true when the Seraph pipeline
      * is live and hasn't auth-failed. Called reflectively by
      * {@link Agent#onOutgoingChat}'s status branch.
      */
     public static boolean isSeraphEnabled() {
         SeraphCache sc = seraphCache;
+        return sc != null && !sc.authFailed();
+    }
+
+    /**
+     * Agent-facing query for {@code AX-status} — true when the Hypixel pipeline
+     * is live and hasn't auth-failed. Called reflectively by
+     * {@link Agent#onOutgoingChat}'s status branch.
+     */
+    public static boolean isHypixelEnabled() {
+        StatsCache sc = statsCache;
         return sc != null && !sc.authFailed();
     }
 
@@ -662,8 +829,9 @@ public final class AgentImpl {
             UUID uuid = resolved.uuid;
             String name = resolved.canonicalName;
 
+            StatsCache hc = statsCache;
             CompletableFuture<BedwarsStats> hypixelFut =
-                    statsCache != null ? statsCache.get(uuid) : null;
+                    (hc != null && !hc.authFailed()) ? hc.get(uuid) : null;
             SeraphCache sc = seraphCache;
             CompletableFuture<SeraphData> seraphFut =
                     (sc != null && !sc.authFailed()) ? sc.get(uuid) : null;
@@ -675,7 +843,7 @@ public final class AgentImpl {
             awaitQuietly(seraphFut, 15);
 
             Agent.sendClientChat(Agent.PREFIX + "§a" + name + " (" + uuid + ")", mcLoader);
-            for (String line : formatHypixelLines(hypixelFut, config)) {
+            for (String line : formatHypixelLines(hc, hypixelFut, config)) {
                 Agent.sendClientChat(Agent.PREFIX + "  " + line, mcLoader);
             }
             sendSeraphLine(sc, seraphFut, mcLoader);
@@ -700,9 +868,11 @@ public final class AgentImpl {
      * tiers applied from {@code cfg.colors}. Denominators (deaths, losses) have
      * no tier ladder by convention and render in dim gray.
      */
-    private static java.util.List<String> formatHypixelLines(CompletableFuture<BedwarsStats> fut, Config cfg) {
+    private static java.util.List<String> formatHypixelLines(StatsCache sc, CompletableFuture<BedwarsStats> fut, Config cfg) {
         java.util.List<String> out = new java.util.ArrayList<String>();
-        if (fut == null) { out.add("hypixel: §7disabled (no key)"); return out; }
+        if (sc == null) { out.add("hypixel: §7disabled (no key)"); return out; }
+        if (sc.authFailed()) { out.add("hypixel: §cauth failed (run AX-hypixel <newkey>)"); return out; }
+        if (fut == null) { out.add("hypixel: §7no fetch"); return out; }
         if (!fut.isDone()) { out.add("hypixel: §7timed out"); return out; }
         if (fut.isCompletedExceptionally()) { out.add("hypixel: §clookup failed"); return out; }
         BedwarsStats s = fut.getNow(null);
@@ -1018,9 +1188,9 @@ public final class AgentImpl {
                 // StatsCache.get dedups in-flight requests AND serves cached
                 // results instantly — so this is a no-op for UUIDs we already
                 // have fresh data for, and a no-double-fire for UUIDs whose
-                // request started on a previous arm tick.
-                statsCache.get(uuid);
-                kicked++;
+                // request started on a previous arm tick. Returns null if
+                // the cache has auth-failed; skip counting those.
+                if (statsCache.get(uuid) != null) kicked++;
                 // Parallel Seraph pre-warm — same dedup semantics via SeraphCache.get.
                 // Skipped entirely when key is unset or session has auth-failed.
                 if (sc != null && !sc.authFailed() && sc.get(uuid) != null) {
@@ -1040,7 +1210,11 @@ public final class AgentImpl {
         Config cfg = config;
         String[] colIds = cfg.columns.toArray(new String[0]);
         String[] headers = buildHeaders(cfg);
-        if (npis == null || statsCache == null) {
+        StatsCache sc = statsCache;
+        if (sc != null && sc.authFailed()) {
+            maybeFireHypixelAuthWarning();
+        }
+        if (npis == null || sc == null) {
             return new Object[] { colIds, headers, Collections.emptyList() };
         }
         try {
@@ -1281,6 +1455,20 @@ public final class AgentImpl {
         seraphAuthWarningFired = true;
         Agent.log("seraph: API key rejected (401/403) — suppressing further lookups until AX-seraph <newkey>");
         Agent.sendClientChat(Agent.PREFIX + "§cSeraph API key rejected — run AX-seraph <key> to update" + RESET,
+                capturedMcLoader);
+    }
+
+    /**
+     * Emit the red "Hypixel API key rejected" warning exactly once per session,
+     * the first frame after {@link StatsCache#authFailed()} flips true. The
+     * probe path pre-fires this latch on rotation failure so the render path
+     * stays silent for that case.
+     */
+    private static void maybeFireHypixelAuthWarning() {
+        if (hypixelAuthWarningFired) return;
+        hypixelAuthWarningFired = true;
+        Agent.log("hypixel: API key rejected (401/403) — suppressing further lookups until AX-hypixel <newkey>");
+        Agent.sendClientChat(Agent.PREFIX + "§cHypixel API key rejected — run AX-hypixel <key> to update" + RESET,
                 capturedMcLoader);
     }
 

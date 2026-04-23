@@ -325,11 +325,21 @@ public final class Agent {
             if (trimmed.equalsIgnoreCase("AX-status")) {
                 sendClientChat(PREFIX + "§edisplay=" + (displayEnabled ? "on" : "off")
                         + " fetch=" + (fetchArmed ? "armed" : "idle")
+                        + " hypixel=" + (isHypixelEnabled() ? "on" : "off")
                         + " seraph=" + (isSeraphEnabled() ? "on" : "off"));
                 return true;
             }
             if (trimmed.equalsIgnoreCase("AX-help")) {
                 sendHelp();
+                return true;
+            }
+            // AX-hypixel <key> — rotate the Hypixel API key (M16). Bridged into
+            // AgentImpl for the same reason as AX-seraph: SeraphCache/StatsCache
+            // live on bootstrap. Handled BEFORE the typo guard; the prefix is
+            // length 10.
+            if (isAxHypixelCommand(trimmed)) {
+                String rest = trimmed.length() > 10 ? trimmed.substring(10).trim() : "";
+                onAxHypixel(rest);
                 return true;
             }
             // AX-seraph <key> — rotate the Seraph API key. Bridged into AgentImpl
@@ -521,6 +531,10 @@ public final class Agent {
         return matchesAxPrefix(s, "ax-seraph");
     }
 
+    private static boolean isAxHypixelCommand(String s) {
+        return matchesAxPrefix(s, "ax-hypixel");
+    }
+
     private static boolean isAxCheckCommand(String s) {
         return matchesAxPrefix(s, "ax-check");
     }
@@ -537,6 +551,7 @@ public final class Agent {
         sendClientChat(PREFIX + "  §fAX-help §8— this list");
         sendClientChat(PREFIX + "  §fAX-mode §7[§flist§7|§f<name>§7] §8— list modes or switch the active one");
         sendClientChat(PREFIX + "  §fAX-ignore <name> §7/ §fAX-removeignore <name> §8— manage threat-report ignore list");
+        sendClientChat(PREFIX + "  §fAX-hypixel <key> §8— rotate Hypixel API key (hot-swap, no restart)");
         sendClientChat(PREFIX + "  §fAX-seraph <key> §8— rotate Seraph API key (hot-swap, no restart)");
         sendClientChat(PREFIX + "  §fAX-check <name> §8— debug: dump Hypixel + Seraph for a player");
     }
@@ -636,6 +651,29 @@ public final class Agent {
     private static volatile Method implOnAxSeraphMethod;
 
     /**
+     * Bridge for {@code AX-hypixel <key>} into {@link AgentImpl}. Validates the
+     * key argument isn't empty, persists via {@link com.aurex.agent.api.Config#writeApiKey},
+     * rebuilds {@link AgentImpl}'s Hypixel pipeline in place, and fires a probe
+     * that reports pass/fail/network in chat. {@link AgentImpl#onAxHypixel(String)}
+     * log-scrubs the key body so the raw value never lands in {@code agent.log}.
+     */
+    private static void onAxHypixel(String rest) {
+        try {
+            Method m = implOnAxHypixelMethod;
+            if (m == null) {
+                m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                        .getMethod("onAxHypixel", String.class);
+                implOnAxHypixelMethod = m;
+            }
+            m.invoke(null, rest);
+        } catch (Throwable t) {
+            log("onAxHypixel bridge failed: " + t);
+        }
+    }
+
+    private static volatile Method implOnAxHypixelMethod;
+
+    /**
      * Read-only query for AX-status — "is Seraph wired up?" Returns true when
      * AgentImpl currently has a non-null {@code seraphCache} and no auth
      * failure. Bridges reflectively so the MC copy of Agent doesn't need a
@@ -658,6 +696,29 @@ public final class Agent {
     }
 
     private static volatile Method implSeraphStatusMethod;
+
+    /**
+     * Read-only query for AX-status — "is Hypixel wired up?" Returns true when
+     * AgentImpl currently has a non-null {@code statsCache} and no auth
+     * failure. Bridges reflectively for the same reason as {@link #isSeraphEnabled};
+     * returns false on any reflection error so the status line stays honest.
+     */
+    private static boolean isHypixelEnabled() {
+        try {
+            Method m = implHypixelStatusMethod;
+            if (m == null) {
+                m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                        .getMethod("isHypixelEnabled");
+                implHypixelStatusMethod = m;
+            }
+            Object res = m.invoke(null);
+            return res instanceof Boolean && (Boolean) res;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static volatile Method implHypixelStatusMethod;
 
     /**
      * Bridge for {@code AX-check <name>} into {@link AgentImpl#onAxCheck}.

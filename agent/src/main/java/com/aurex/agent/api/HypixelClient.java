@@ -3,6 +3,7 @@ package com.aurex.agent.api;
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -27,7 +28,8 @@ import java.util.function.Consumer;
  *   <li><b>Async-only.</b> {@link #fetch(UUID)} returns a {@link CompletableFuture}
  *       — callers on the render thread never block on network.</li>
  *   <li><b>Rate-limited.</b> Every fetch goes through a shared {@link RateLimiter}
- *       so we never exceed Hypixel's 120 req/min cliff.</li>
+ *       so we stay well under Hypixel's 300-req-per-5-min ceiling. Actual limit
+ *       is advertised per-key in the {@code RateLimit-*} response headers.</li>
  *   <li><b>Dedicated executor.</b> A small fixed pool keeps HTTP latency off
  *       whatever caller thread invokes us; render-thread hands are always clean.</li>
  *   <li><b>No request dedup here.</b> Two {@code fetch(sameUUID)} calls will run
@@ -157,6 +159,17 @@ public final class HypixelClient {
             conn.setReadTimeout(READ_TIMEOUT_MS);
 
             int code = conn.getResponseCode();
+            if (code == 401 || code == 403) {
+                // Key-level auth rejection. Typed so StatsCache can latch the
+                // session-wide authFailed flag; AgentImpl surfaces a one-shot
+                // chat warning and suppresses further fetches until the user
+                // runs AX-hypixel <newkey>.
+                String body = readErrorBody(conn);
+                logger.accept("api: auth rejected (HTTP " + code + ")"
+                        + (body.isEmpty() ? "" : " body=" + body));
+                throw new HypixelAuthException("Hypixel rejected API key (HTTP " + code + ")"
+                        + (body.isEmpty() ? "" : ": " + body));
+            }
             if (code == 404) {
                 // Hypixel returns 404 for unknown UUIDs. Treat as "no data".
                 return null;
@@ -167,6 +180,9 @@ public final class HypixelClient {
                 // those seconds on this thread so we don't immediately try again
                 // and dig a deeper hole.
                 int resetSec = parseIntHeader(conn, "RateLimit-Reset", 10);
+                String body = readErrorBody(conn);
+                logger.accept("api: rate limited (HTTP 429), sleeping " + resetSec + "s"
+                        + (body.isEmpty() ? "" : " body=" + body));
                 try {
                     Thread.sleep(TimeUnit.SECONDS.toMillis(Math.max(1, resetSec)));
                 } catch (InterruptedException ignored) {
@@ -175,7 +191,11 @@ public final class HypixelClient {
                 throw new IOException("Hypixel rate limit hit (429); slept " + resetSec + "s");
             }
             if (code != 200) {
-                throw new IOException("HTTP " + code + " from Hypixel");
+                String body = readErrorBody(conn);
+                logger.accept("api: non-200 (HTTP " + code + ")"
+                        + (body.isEmpty() ? "" : " body=" + body));
+                throw new IOException("HTTP " + code + " from Hypixel"
+                        + (body.isEmpty() ? "" : ": " + body));
             }
 
             // Observability: if the server tells us we're nearly out of budget,
@@ -220,6 +240,35 @@ public final class HypixelClient {
             return Integer.parseInt(v.trim());
         } catch (NumberFormatException e) {
             return defaultValue;
+        }
+    }
+
+    /**
+     * Slurp the error-stream body (truncated) for logging. Best-effort — any
+     * failure returns empty string. Truncated to 200 chars so a giant error
+     * page can't bloat agent.log. Hypixel's error bodies are usually
+     * {@code {"success":false,"cause":"..."}} which fits easily.
+     */
+    private static String readErrorBody(HttpURLConnection conn) {
+        InputStream err = conn.getErrorStream();
+        if (err == null) return "";
+        try {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            byte[] buf = new byte[512];
+            int total = 0;
+            int n;
+            while (total < 1024 && (n = err.read(buf)) != -1) {
+                baos.write(buf, 0, n);
+                total += n;
+            }
+            String s = new String(baos.toByteArray(), StandardCharsets.UTF_8)
+                    .replace('\n', ' ').replace('\r', ' ').trim();
+            if (s.length() > 200) s = s.substring(0, 197) + "...";
+            return s;
+        } catch (IOException e) {
+            return "";
+        } finally {
+            try { err.close(); } catch (IOException ignored) {}
         }
     }
 
