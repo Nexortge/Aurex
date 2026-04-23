@@ -26,16 +26,20 @@ A Seraph-style stat overlay **injected into Lunar Client** (Minecraft 1.8.9) tha
 
 - Lunar launcher: `C:\Users\nexor\AppData\Local\Programs\Lunar Client\`
 - Lunar per-user data: `C:\Users\nexor\.lunarclient\`
-- Our global config: `%APPDATA%\Aurex\config.json` — `apiKey`, `activeMode`, `nickDetection`, `chatAlerts`. Identity-scoped; doesn't change on mode switch.
-- Our per-mode configs: `%APPDATA%\Aurex\modes\<mode>.json` — `columns`, `colors`. One file per game mode (`bedwars.json` ships first). Swapped wholesale via `AX-mode <name>`.
+- Our global config: `%APPDATA%\Aurex\config.json` — `apiKey`, `seraphApiKey`, `activeMode`, `nickDetection`, `chatAlerts`, `ignoreList`. Identity-scoped; doesn't change on mode switch.
+- Our per-mode configs: `%APPDATA%\Aurex\modes\<mode>.json` — `columns`, `colors`, `headers`, `alerts` (FKDR/stars threat thresholds). One file per game mode (`bedwars.json` ships first). Swapped wholesale via `AX-mode <name>`.
 - Our log: `%APPDATA%\Aurex\agent.log`
 - Lunar main class (confirmed via `jps -l`): `com.moonsworth.lunar.genesis.Genesis`
 
 ## Chat commands (in-game)
 
 - `AX-on` / `AX-off` / `AX-status` — arm/disarm display + fetch; status readout.
+- `AX-help` — list all AX-* commands in client chat.
 - `AX-mode` / `AX-mode list` — list known modes (active one marked with `§a*`).
 - `AX-mode <name>` — persist `activeMode` to `config.json` and hot-reload. Auto-generates `modes/<name>.json` with defaults if missing.
+- `AX-ignore <name>` / `AX-removeignore <name>` — add/remove a username from `ignoreList`. Ignored players (and their scoreboard team) are excluded from the M14 game-start threat report — typically your own alts.
+- `AX-seraph <key>` — rotate the Seraph API key. Persists to `config.json`, hot-swaps the running `SeraphCache` without a restart. Raw key is never logged.
+- `AX-check <name>` — debug: Mojang username → UUID, fires Hypixel + Seraph lookups for that UUID, dumps the results in client chat. Bypasses arm/display gates so it works any time. Useful for verifying integration without queueing into a lobby.
 
 ## Project layout (planned)
 

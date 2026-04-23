@@ -324,7 +324,29 @@ public final class Agent {
             }
             if (trimmed.equalsIgnoreCase("AX-status")) {
                 sendClientChat(PREFIX + "§edisplay=" + (displayEnabled ? "on" : "off")
-                        + " fetch=" + (fetchArmed ? "armed" : "idle"));
+                        + " fetch=" + (fetchArmed ? "armed" : "idle")
+                        + " seraph=" + (isSeraphEnabled() ? "on" : "off"));
+                return true;
+            }
+            if (trimmed.equalsIgnoreCase("AX-help")) {
+                sendHelp();
+                return true;
+            }
+            // AX-seraph <key> — rotate the Seraph API key. Bridged into AgentImpl
+            // (where the SeraphCache lives) so the key never gets written to the
+            // MC-loader copy of Agent. Must be handled BEFORE the typo guard and
+            // before the AX-ignore prefix — "AX-seraph" is length 9, same as
+            // "AX-ignore", and their 4th chars differ (s vs i) so no overlap.
+            if (isAxSeraphCommand(trimmed)) {
+                String rest = trimmed.length() > 9 ? trimmed.substring(9).trim() : "";
+                onAxSeraph(rest);
+                return true;
+            }
+            // AX-check <name> — debug command: Mojang username -> UUID, then
+            // dump Hypixel + Seraph results to client chat. Length-8 prefix.
+            if (isAxCheckCommand(trimmed)) {
+                String rest = trimmed.length() > 8 ? trimmed.substring(8).trim() : "";
+                onAxCheck(rest);
                 return true;
             }
             // AX-mode [name] — list known modes, or switch active mode and hot-reload.
@@ -495,6 +517,30 @@ public final class Agent {
         return matchesAxPrefix(s, "ax-removeignore");
     }
 
+    private static boolean isAxSeraphCommand(String s) {
+        return matchesAxPrefix(s, "ax-seraph");
+    }
+
+    private static boolean isAxCheckCommand(String s) {
+        return matchesAxPrefix(s, "ax-check");
+    }
+
+    /**
+     * Dump the full AX-* command catalog into client chat. Runs entirely from
+     * Agent (no AgentImpl bridge needed) since it's stateless text. Kept in
+     * sync with the chat-commands section of CLAUDE.md by hand — small enough
+     * that a file-driven loader would be overkill.
+     */
+    private static void sendHelp() {
+        sendClientChat(PREFIX + "§acommands:");
+        sendClientChat(PREFIX + "  §fAX-on §7/ §fAX-off §7/ §fAX-status §8— arm/disarm + status readout");
+        sendClientChat(PREFIX + "  §fAX-help §8— this list");
+        sendClientChat(PREFIX + "  §fAX-mode §7[§flist§7|§f<name>§7] §8— list modes or switch the active one");
+        sendClientChat(PREFIX + "  §fAX-ignore <name> §7/ §fAX-removeignore <name> §8— manage threat-report ignore list");
+        sendClientChat(PREFIX + "  §fAX-seraph <key> §8— rotate Seraph API key (hot-swap, no restart)");
+        sendClientChat(PREFIX + "  §fAX-check <name> §8— debug: dump Hypixel + Seraph for a player");
+    }
+
     /**
      * Case-insensitive prefix match: {@code s} starts with {@code prefix} and is
      * either the same length or immediately followed by a space. Used by all
@@ -565,6 +611,74 @@ public final class Agent {
 
     private static volatile Method implOnAxIgnoreMethod;
     private static volatile Method implOnAxRemoveIgnoreMethod;
+
+    /**
+     * Bridge for {@code AX-seraph <key>} into {@link AgentImpl}. Validates the
+     * key argument isn't empty, persists via {@link com.aurex.agent.api.Config#writeSeraphApiKey},
+     * reinitialises {@link AgentImpl}'s Seraph pipeline with the new key, and
+     * confirms in chat. {@link AgentImpl#onAxSeraph(String)} log-scrubs the key
+     * body so the raw value never lands in {@code agent.log}.
+     */
+    private static void onAxSeraph(String rest) {
+        try {
+            Method m = implOnAxSeraphMethod;
+            if (m == null) {
+                m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                        .getMethod("onAxSeraph", String.class);
+                implOnAxSeraphMethod = m;
+            }
+            m.invoke(null, rest);
+        } catch (Throwable t) {
+            log("onAxSeraph bridge failed: " + t);
+        }
+    }
+
+    private static volatile Method implOnAxSeraphMethod;
+
+    /**
+     * Read-only query for AX-status — "is Seraph wired up?" Returns true when
+     * AgentImpl currently has a non-null {@code seraphCache} and no auth
+     * failure. Bridges reflectively so the MC copy of Agent doesn't need a
+     * compile-time reference; returns false on any reflection error to keep
+     * the status line honest.
+     */
+    private static boolean isSeraphEnabled() {
+        try {
+            Method m = implSeraphStatusMethod;
+            if (m == null) {
+                m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                        .getMethod("isSeraphEnabled");
+                implSeraphStatusMethod = m;
+            }
+            Object res = m.invoke(null);
+            return res instanceof Boolean && (Boolean) res;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static volatile Method implSeraphStatusMethod;
+
+    /**
+     * Bridge for {@code AX-check <name>} into {@link AgentImpl#onAxCheck}.
+     * Same reflective pattern as the other Impl bridges — keeps the MC-loader
+     * copy of Agent free of compile-time refs to bootstrap-only state.
+     */
+    private static void onAxCheck(String rest) {
+        try {
+            Method m = implOnAxCheckMethod;
+            if (m == null) {
+                m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                        .getMethod("onAxCheck", String.class);
+                implOnAxCheckMethod = m;
+            }
+            m.invoke(null, rest);
+        } catch (Throwable t) {
+            log("onAxCheck bridge failed: " + t);
+        }
+    }
+
+    private static volatile Method implOnAxCheckMethod;
 
     private static boolean looksLikeAxCommand(String s) {
         if (s.length() < 3) return false;
@@ -928,6 +1042,71 @@ public final class Agent {
             addChatMessage.invoke(thePlayer, component);
         } catch (Throwable t) {
             log("sendClientChat failed: " + t);
+        }
+    }
+
+    /**
+     * Variant of {@link #sendClientChat(String, ClassLoader)} that attaches a
+     * {@code SHOW_TEXT} hover event to individual segments. Each row of
+     * {@code segments} is {@code {text, hoverTextOrNull}} — when the hover half
+     * is {@code null}, the segment renders as plain text. Use this when you
+     * want tooltips on part of a chat line (e.g. Seraph tag + its reason).
+     *
+     * <p>Built reflectively against {@code ChatComponentText}, {@code ChatStyle},
+     * and {@code HoverEvent.Action.SHOW_TEXT}, so this stays loader-boundary
+     * safe — only strings cross the bootstrap → MC-loader call.
+     */
+    static void sendClientChatWithHovers(String[][] segments, ClassLoader mcLoader) {
+        if (segments == null || segments.length == 0) return;
+        try {
+            ClassLoader cl = mcLoader;
+            if (cl == null) cl = Thread.currentThread().getContextClassLoader();
+            if (cl == null) cl = Agent.class.getClassLoader();
+
+            Class<?> mcClass = Class.forName("net.minecraft.client.Minecraft", true, cl);
+            Object mc = mcClass.getMethod("getMinecraft").invoke(null);
+            Object thePlayer = mcClass.getField("thePlayer").get(mc);
+            if (thePlayer == null) {
+                log("sendClientChatWithHovers: thePlayer is null, skipping");
+                return;
+            }
+
+            Class<?> compClass = Class.forName("net.minecraft.util.ChatComponentText", true, cl);
+            Class<?> iComp = Class.forName("net.minecraft.util.IChatComponent", true, cl);
+            Class<?> styleClass = Class.forName("net.minecraft.util.ChatStyle", true, cl);
+            Class<?> hoverClass = Class.forName("net.minecraft.event.HoverEvent", true, cl);
+            @SuppressWarnings({ "unchecked", "rawtypes" })
+            Class<? extends Enum> hoverAction = (Class<? extends Enum>) Class.forName(
+                    "net.minecraft.event.HoverEvent$Action", true, cl);
+            @SuppressWarnings("unchecked")
+            Object showText = Enum.valueOf(hoverAction, "SHOW_TEXT");
+
+            // Root is an empty text — all real content is appended as siblings.
+            // Keeps the append loop uniform (root never has hover itself).
+            Object root = compClass.getConstructor(String.class).newInstance("");
+            Method appendSibling = iComp.getMethod("appendSibling", iComp);
+            Method setStyle = iComp.getMethod("setChatStyle", styleClass);
+            Method setHover = styleClass.getMethod("setChatHoverEvent", hoverClass);
+
+            for (String[] seg : segments) {
+                if (seg == null || seg.length == 0 || seg[0] == null) continue;
+                Object piece = compClass.getConstructor(String.class).newInstance(seg[0]);
+                String hoverText = seg.length > 1 ? seg[1] : null;
+                if (hoverText != null && !hoverText.isEmpty()) {
+                    Object hoverComp = compClass.getConstructor(String.class).newInstance(hoverText);
+                    Object hoverEvt = hoverClass.getConstructor(hoverAction, iComp)
+                            .newInstance(showText, hoverComp);
+                    Object style = styleClass.getConstructor().newInstance();
+                    setHover.invoke(style, hoverEvt);
+                    setStyle.invoke(piece, style);
+                }
+                appendSibling.invoke(root, piece);
+            }
+
+            Class<?> entityPlayer = Class.forName("net.minecraft.entity.player.EntityPlayer", true, cl);
+            entityPlayer.getMethod("addChatMessage", iComp).invoke(thePlayer, root);
+        } catch (Throwable t) {
+            log("sendClientChatWithHovers failed: " + t);
         }
     }
 

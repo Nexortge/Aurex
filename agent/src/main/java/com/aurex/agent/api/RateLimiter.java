@@ -48,6 +48,16 @@ public final class RateLimiter {
     }
 
     /**
+     * Defaults: 90 req/min, burst of 16. Verified via response headers: Seraph
+     * advertises {@code x-ratelimit-limit: 120}; we sit a little under so a
+     * burst doesn't trip the cliff and the user has headroom for browser /
+     * other-tool traffic on the same key.
+     */
+    public static RateLimiter defaultSeraph() {
+        return new RateLimiter(90, 16);
+    }
+
+    /**
      * Block until a single token is available, then consume it.
      * <p>Sleeps outside the lock so other threads can still refill + acquire
      * concurrently. May still take multiple iterations if many threads contend

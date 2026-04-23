@@ -184,6 +184,17 @@ public final class ModeConfig {
             {20,   "red"},
     };
 
+    /**
+     * Placeholder ladder for {@code tag} — Seraph supplies the actual §-codes
+     * per tag (mapped from Cubelify RGB at parse time), so {@link ColorTier}
+     * never runs against this column. The single-tier entry exists solely so
+     * the self-documenting default {@code modes/bedwars.json} lists
+     * {@code colors.tag} alongside the other columns (M11 discovery pattern).
+     */
+    private static final Object[][] BW_TAG = {
+            {0, "white"},
+    };
+
     /** All supported Bedwars-mode columns. Keys must match {@link Config} COL_* constants. */
     private static final Map<String, Object[][]> BW_COLOR_DEFAULTS;
     static {
@@ -200,6 +211,7 @@ public final class ModeConfig {
         m.put(Config.COL_WINSTREAK, BW_WINSTREAK);
         m.put(Config.COL_KDR,       BW_KDR);
         m.put(Config.COL_BBLR,      BW_BBLR);
+        m.put(Config.COL_TAG,       BW_TAG);
         BW_COLOR_DEFAULTS = Collections.unmodifiableMap(m);
     }
 
@@ -220,6 +232,7 @@ public final class ModeConfig {
         m.put(Config.COL_WINSTREAK, "WS");
         m.put(Config.COL_KDR,       "KDR");
         m.put(Config.COL_BBLR,      "BBLR");
+        m.put(Config.COL_TAG,       "Tag");
         BW_HEADER_DEFAULTS = Collections.unmodifiableMap(m);
     }
 

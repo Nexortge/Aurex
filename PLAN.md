@@ -237,62 +237,78 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 
 ---
 
-## M12 — Extended Bedwars stat columns
+## M12 — Extended Bedwars stat columns — **Done (2026-04-22).**
 
 **Goal:** Flesh out the Bedwars-mode column catalog beyond the M11 five so users can actually tune what they see. Every new column ships with its default color ladder in `modes/bedwars.json` so the self-documenting file stays useful.
 
-**Deliverable:**
-- Finals (total final kills), Beds (beds broken), Winstreak (current — field is API-gated per-account; graceful fallback to `—` when hidden), KDR (regular kill / death), BBLR (beds broken / lost).
-- New `Config.COL_*` constants + `ModeConfig.BW_*` default palettes + `AgentImpl.headerFor` / `formatCell` branches. One `case` per column — additive.
+**What shipped:**
+- Added columns: `finals` (total final kills), `beds` (beds broken), `winstreak` (API-gated per account — null-safe fallback to `—` when the user has hidden it), `kdr` (regular kill / death), `bblr` (beds broken / lost).
 - `BedwarsStats` extended with the matching fields; `HypixelClient` parses them from the same `/v2/player` payload (no extra API call).
-- Defaults NOT added to the default `columns` array — users opt in by editing `modes/bedwars.json`. They see the palette in `colors.*` even when the column isn't displayed (M11 self-documenting pattern).
+- New `Config.COL_*` constants + `ModeConfig.BW_*` default palettes + `AgentImpl.formatCell` branches. One `case` per column — additive.
+- Defaults NOT added to the default `columns` array — users opt in by editing `modes/bedwars.json`. The palette entries exist in `colors.*` even when the column isn't displayed, so they're discoverable (M11 self-documenting pattern).
 
-**Success check:** Add `"finals"` to a local `modes/bedwars.json`, `AX-mode bedwars` to hot-reload, see the finals column in tab with colored tiers.
-
-**Why here and not later:** scaling the column set after other mode-specific features (target alerts, Seraph integration) would need every added feature to retrofit per-column hooks. Landing the extended catalog now means M13+ can assume a stable column schema.
+**Why here and not later:** scaling the column set after other mode-specific features (target alerts, Seraph integration) would need every added feature to retrofit per-column hooks. Landing the extended catalog before M14+ lets later milestones assume a stable column schema.
 
 ---
 
-## M13 — Custom column headers
+## M13 — Custom column headers — **Done (2026-04-22).**
 
 **Goal:** Promote tab column headers from hardcoded strings to a user-editable map in the per-mode config, so users can rename `FKDR` → `FK/FD`, swap `✫` for `★`, or localize labels.
 
-**Deliverable:**
-- New `headers: { <colId>: <string> }` object in `modes/<mode>.json`. Ships with the current defaults (`stars → ✫`, `name → Name`, `fkdr → FKDR`, `wl → W/L`, `wins → Wins`, `health → HP` plus the M12 additions).
-- `ModeConfig.load` parses the map; unknown column ids go into `issues` and are ignored. Missing entries fall back to built-in defaults — same forward-compat pattern as `colors`.
-- `AgentImpl.headerFor(String col)` reads from the loaded config; `buildHeaders` stays unchanged.
+**What shipped:**
+- `headers: { <colId>: <string> }` object in `modes/<mode>.json`. Ships with defaults for every column M11 + M12 added (`stars → ✫`, `name → Name`, `fkdr → FKDR`, `wl → W/L`, `wins → Wins`, `health → HP`, `finals → Finals`, `beds → Beds`, `ws → WS`, `kdr → KDR`, `bblr → BBLR`).
+- `ModeConfig.parseHeaders` parses the map; unknown column ids go into `issues` and are ignored. Missing entries fall back to built-in defaults — same forward-compat/self-heal pattern as `colors`, so pre-M13 user files pick up the new entries on next launch without a wipe.
+- `AgentImpl.headerFor(String col)` reads from the loaded config; `buildHeaders` stays unchanged otherwise.
 - Auto-generated default mode file includes a header entry for every column so the file keeps being self-documenting.
 
-**Success check:** Edit `modes/bedwars.json` to rename `FKDR` → `FK/FD`, `AX-mode bedwars` to hot-reload, see the new header in tab.
+---
+
+## M14 — Game-start threat report + ignore list — **Mostly done (2026-04-22).**
+
+**Goal redirected during implementation:** the original plan was a *targeted* alert system — per-player list with reasons and row tags. What we actually needed in-game was the opposite shape: a *threshold* alert (call out whichever opponents are dangerous, not opponents you named ahead of time), plus an *ignore* list to exclude your own alts from being flagged as threats. Shipped the threshold flavor; the named-target flavor is deferred.
+
+**What shipped:**
+- `ThreatReportTask` fires once per game, `THREAT_REPORT_DELAY_MS` after auto-arm (M10 countdown hook). Scheduled on Aurex's Timer thread; reads from the warm `StatsCache`.
+- `AgentImpl.fireThreatReport` groups opponents by scoreboard team → one chat line per team, listing every player that clears `fkdrThreshold` OR `starsThreshold`. Detected nicks always flagged. When nothing clears thresholds anywhere, falls back to a single "§ano sweats — best: …" line with the highest-FKDR opponent so the report is never empty.
+- **Bedwars per-slot team canonicalization** (required for teams-of-one / filled teams): Hypixel assigns each player their own scoreboard team (`Green10`, `Green11`, `Red0`, …). Raw `getRegisteredName` grouping emitted one line per opponent and missed the user's own teammates. `AgentImpl.canonicalizeTeamKey` strips the trailing digit run so `Green{N}` collapses to `Green` — one line per color, and the user's team excludes all teammates.
+- **Own-team exclusion with three signals** (any one wins): (1) `thePlayer.getTeam().getRegisteredName()` via `fetchOwnTeamKey`, (2) UUID match against `fetchOwnUuid`, (3) name match against `ignoreList` promoting the whole team. Redundant on purpose — (1) fails briefly at world transitions when `thePlayer` is null.
+- Per-mode `alerts.fkdrThreshold` / `alerts.starsThreshold` added to `modes/<mode>.json`; defaults `5.0` / `500` for Bedwars. Legacy global `alerts` block auto-migrated into the active-mode file on first load (then stripped from `config.json`) so pre-M14 user edits aren't lost.
+- `ignoreList` (lowercased usernames) in global config, edited via `AX-ignore <name>` / `AX-removeignore <name>`. Lives in the global file because alt lists are identity-scoped — same alt across all modes.
+- `DisarmTask` chat banner cosmetic tweak to match the M14 `[AX] §efetch window closed` prefix style (was inconsistent).
+
+**Not shipped (deferred):**
+- Named-target system: UUID/IGN-specific alerts with per-entry reasons (`AX-target add <name> <reason>` / `AX-target list`) and row tagging in tab. If the threshold report covers "identify sweats" well enough in practice, this may not need its own milestone — can be absorbed into M15 (Seraph cheater/client tags) since the row-tag + chat-alert plumbing overlaps.
+
+**Verified 2026-04-22:** private Bedwars game, team-of-one — threat report fires at match start, groups opponents under `Team Red`, excludes own `Team Green`. Nicks appear with `[NICK]` tag. `AX-ignore <name>` excludes the named player's whole team from the report.
 
 ---
 
-## M14 — Chat target alert system
+## M15 — Seraph API integration (cheater tags) — **Shipped, pending in-game verification (2026-04-22).**
 
-**Goal:** Call out specific players (sweats, griefers, known cheaters) in chat the moment they show up in tab.
+**What shipped:**
+- `SeraphClient` (`agent/src/main/java/com/aurex/agent/api/SeraphClient.java`) — async HTTP client mirroring `HypixelClient`. `fetch(UUID)` hits `/cubelify/blacklist/{uuid}` with the `Seraph-API-Key` header and returns a `SeraphData`. 401/403 → typed `SeraphAuthException`. Defaults to 90 req/min via new `RateLimiter.defaultSeraph()` factory (Seraph advertises `x-ratelimit-limit: 120`; we sit under for headroom).
+- `SeraphCache` — copy of `StatsCache` (1h TTL, ConcurrentHashMap of in-flight futures, `get` / `peekFuture` / `invalidate`). Adds a sticky `authFailed()` flag — first `SeraphAuthException` flips it true and all future `get` calls short-circuit until the user rotates their key, so a bad key doesn't machine-gun Seraph every tab render.
+- `SeraphData` + `SeraphTag` — immutable POJOs. RGB-to-§-code mapping in `SeraphColors.rgbToSection` runs at parse time so render-path cells are plain string concats. Cheater + bot flags are precomputed off `tag_name` (contains `cheat` / `sniper` / `blacklist` → cheater; `bot` → bot).
+- Global config gains `seraphApiKey` (identity-scoped, preserves other fields via new `Config.writeSeraphApiKey`). Env-var fallback intentionally not shipped — M16 territory.
+- One new opt-in column registered in `ModeConfig`: `tag` (Seraph blacklist state, Seraph-supplied colors passed through). Default header + placeholder color ladder ship with the mode defaults so the self-documenting JSON keeps listing it even when not displayed (M11 pattern).
+- `AgentImpl`: `seraphCache` field alongside `statsCache`, kicked off in both `preWarmFetches` and the render-path `buildRawRow`. `RawRow` carries `SeraphData` so the tag cell renders on any row type (a nicked cheater still gets called out). `formatCell` branch for `COL_TAG` handles placeholder/blank states per row status.
+- One-shot chat alerts on first cheater/bot sighting per arm cycle via `alertedCheaters` / `alertedBots` sets, dedup-cleared alongside nicks in `AgentImpl.clearNickAlerts` (called from `Agent.disarm` on `AX-off`). `§4<name> is tagged: <reason>` for cheaters, `§e<name> is a bot` for bots.
+- `AX-seraph <key>` chat command wired through `Agent.onOutgoingChat` → `AgentImpl.onAxSeraph`. Persists key via `Config.writeSeraphApiKey`, reloads config, rebuilds `SeraphCache` in place, and clears the auth-warning latch so a fresh 403 can re-raise. **Raw key is never written to `agent.log`** — only the character length is logged as a fingerprint.
+- `AX-status` readout extended with a `seraph=on/off` leg so users can confirm the pipeline is live without tailing the log.
+- `AX-check <name>` debug command — Mojang username → UUID, fires Hypixel + Seraph lookups, dumps results in client chat. Bypasses arm/display gates so it works any time.
+- Auth-fail UX: first frame after `SeraphCache.authFailed()` flips true, `AgentImpl.maybeFireSeraphAuthWarning` posts one red `§c[AX] Seraph API key rejected — run AX-seraph <key> to update` line and then stays silent.
 
-**Deliverable:**
-- Target list stored in config (UUID or IGN). Probably a `targets.json` alongside `config.json`, editable with `AX-target add <name>` / `AX-target remove <name>` / `AX-target list` chat commands.
-- On tab-render, any NPI whose UUID/IGN is in the list fires a one-shot client chat line like `§c[AX] -> <name> is here (<reason>)§r`.
-- Dedup per UUID per lobby/game session (same pattern as M7 nick alerts — clear on `AX-off` and on game-start hook from M10).
-- Optional: tag row in the table (e.g. red row background or marker column).
+**Scope redirect: detected-client column dropped.** The original plan included a `client` column sourced from `/mod/tests/client/{id}`. That route turned out to be a mod-integration test harness, not a production player lookup (404s on any UUID that hasn't written test data to it first). Cubelify populates their equivalent column via a private server-to-server arrangement with Seraph that our public API key can't replicate. Column removed entirely — tag works, alerts work, blank-until-spec'd wasn't worth the dead code.
 
-**Success check:** Add own alt to target list with reason "alt account" — queue with alt, see chat alert and row tag.
+**Scope redirect from the M14 deferred piece:** the original M15 plan also listed marker/row-tag rendering as an option. Shipped as one additive column instead (`tag`) rather than extending the row schema — keeps the `TabRenderer` loader-boundary unchanged and matches how every other stat column already works. Row-level tinting can land later if anyone asks.
 
----
+**Not shipped (deferred):**
+- `SERAPH_API_KEY` env-var fallback (matches the planned Hypixel env-var story in M16).
+- Named-target system (the M14 deferred piece) — cheater tags cover most of that use case.
+- Seraph safelist / personal-add commands (e.g. `AX-safelist add <name>`) — not needed for V1; users manage their list on seraph.si.
+- Detected-client column — public Seraph API does not expose a viable endpoint; revisit only if one lands.
 
-## M15 — Seraph API integration (cheater + client tags)
-
-**Goal:** Pull community-sourced cheater + client-detection data from the Seraph backend and surface it in tab.
-
-**Deliverable:**
-- HTTP client for the Seraph API (endpoints TBD — needs research; similar rate-limit/caching treatment to Hypixel).
-- For each player in tab, lookup: cheater flag + evidence, detected client (Lunar / Badlion / Feather / vanilla / suspicious).
-- Tab row gets an extra marker column or colored name/bg for flagged players.
-- Chat alert on first sight per session for cheater-flagged players, gated by the same fetch-arm logic as Hypixel stats.
-- Must degrade gracefully if the Seraph API is down — never block render, never crash.
-
-**Success check:** Queue against a known-flagged alt (or test UUID) — see cheater tag in tab and chat alert.
+**Success check (awaiting user confirmation in-game):** paste a valid key via `AX-seraph <key>`, add `"tag"` and `"client"` to `modes/bedwars.json > columns`, `AX-mode bedwars` to hot-reload, queue a Bedwars lobby. Confirm `tag` populates for blacklisted players, `client` shows `[LUNAR]`/etc. for Seraph-known users, cheater/bot alerts fire once per session. Bad-key path: set an invalid key → expect one red `API key rejected` line and no 403 spam in `agent.log`.
 
 ---
 
@@ -313,6 +329,86 @@ We are deliberately not designing anything past M4 in detail — scope past the 
 - Remove the M9 "restart Lunar to apply" warning once hot-swap works.
 
 **Success check:** Pull a working key, let it get rotated / revoke it manually in the dev portal, queue a game — see the red warning with link, run `AX-key <newkey>`, see confirmation, tab stats resume working without restarting Lunar.
+
+---
+
+## M17 — Urchin API integration (second-opinion cheater check)
+
+**Goal:** Cross-reference Seraph's blacklist with a second community-maintained blacklist (Urchin, `docs.urchin.ws`) so a player flagged by *both* sources surfaces as a high-confidence cheater, while single-source flags are still visible but visually distinct.
+
+**Why:** Seraph has false positives and false negatives — so does Urchin. Neither alone is authoritative; the overlap is. Urchin also uses *Cubelify-formatted* tag objects (color/textColor/tag_name/text/tooltip), so we can reuse the existing `SeraphData.SeraphTag` parser without building a second tag schema.
+
+**Endpoint:** `GET https://urchin.ws/cubelify?id=<uuid>&key=<apikey>&name=<ign>&sources=GAME,MANUAL`
+  - Returns `{ score: {value, mode}, tags: [{color, textColor, tag_name, text, tooltip, ...}] }` — Cubelify-compatible, parser parity with Seraph.
+  - Auth is via **query parameter `key=<apikey>`**, not a header — important: URL must never appear verbatim in `agent.log`. Log with the key masked (`key=****`).
+  - `sources` is a required comma-separated enum of `GAME,PARTY,PARTY_INVITES,CHAT,CHAT_MENTIONS,MANUAL,ME`. V1 sends `GAME,MANUAL` (the two we can justify from Aurex's context); a future config knob could expose it.
+  - Also takes `id` (UUID) and `name` (current IGN) — we always have both by the time we fetch.
+  - Response includes a top-level `rate_limit` field — read it and feed back into the client-side limiter in a future iteration; V1 uses a conservative 60 req/min default.
+
+**Alternative endpoints (not used V1):**
+  - `GET /player/{username}` — simpler response shape (`{uuid, tags, rate_limit}`), but `/cubelify` is shape-compatible with the existing SeraphTag parser so we pick that.
+  - `POST /players` (batch) — optimization for the "10 players in a lobby" case; skip V1 since per-UUID cache dedup already collapses concurrent asks.
+  - `wss://urchin.ws/snipers` — real-time sniper tag WebSocket. Cool but orthogonal to the lookup path; separate milestone if we ever want live alerts.
+
+**New files:**
+- `agent/src/main/java/com/aurex/agent/api/UrchinClient.java` — mirrors `SeraphClient`. One HTTP call per `fetch(UUID, String ign)`. 401/403 → typed `UrchinAuthException`; 404 → empty `UrchinData`. Uses `RateLimiter.defaultUrchin()` (new factory, 60/min for now). Masks the API key in all log lines.
+- `agent/src/main/java/com/aurex/agent/api/UrchinCache.java` — mirrors `SeraphCache`. 1h TTL, sticky `authFailed()` flag, `get` / `peekFuture` / `invalidate`.
+- `agent/src/main/java/com/aurex/agent/api/UrchinData.java` — mirrors `SeraphData`. Reuses `SeraphData.SeraphTag` (don't duplicate the class — the tag shape is Cubelify-generic, not source-specific). Precomputes `hasCheaterTag` / `hasBotTag` using the same `CHEATER_TAGS` / `BOT_TAGS` substring sets so both sources classify consistently.
+- `agent/src/main/java/com/aurex/agent/api/UrchinAuthException.java` — typed IOException for 401/403.
+
+**Modified files:**
+- `Config.java` — add `urchinApiKey` field, `RECOGNIZED_KEYS` entry, `writeUrchinApiKey(String)` static method (same preserve-other-fields pattern as `writeSeraphApiKey`). Register `COL_URCHIN = "urchin"`.
+- `ModeConfig.java` — new `urchin` column with header "Urchin" and a placeholder color ladder (colors come from Urchin's response, so the ladder is self-documenting only, same pattern as `BW_TAG`).
+- `AgentImpl.java`:
+  - New static `UrchinCache urchinCache` alongside `seraphCache`. Init in `initApiPipeline` off `cfg.urchinApiKey`.
+  - Extend `RawRow` with `UrchinData urchinData` (nullable) — same nullable-when-disabled pattern as `seraphData`.
+  - `peekOrFetchUrchin` parallel to `peekOrFetchSeraph`; both fire in parallel with Hypixel in `preWarmFetches` and in the render-path `buildRawRow`.
+  - `formatUrchin(RawRow)` — renders first tag the same way `formatTag` does, using colors from the Urchin response.
+  - Alert sets: `alertedUrchinCheaters`, `alertedUrchinBots`. Cleared in the same `clearNickAlerts` sweep (rename consideration: `clearSessionAlerts` — or just keep the existing name, it's already the single catchall).
+  - **Cross-source corroboration alert:** new `alertedDoubleFlags` set. When both `seraphData.hasCheaterTag` AND `urchinData.hasCheaterTag` are true for the same UUID, fire ONE promoted line: `§4§l[AX] -> <name> FLAGGED by Seraph + Urchin§r§c: <seraph reason> / <urchin reason>`. This replaces the two separate single-source alerts for that player (dedup across the three sets by preferring the double-flag when applicable).
+  - `sendSeraphLine` → generalize into `sendSourceLine(String prefix, ... tags, ClassLoader)` so both `seraph:` and `urchin:` lines reuse the hover-tooltip path; or just clone it.
+  - `maybeFireUrchinAuthWarning` parallel to `maybeFireSeraphAuthWarning`. One-shot red warning pointing at `AX-urchin <key>`.
+- `Agent.java`:
+  - `AX-urchin <key>` chat command (mirror `AX-seraph`). Validates non-empty, persists via `Config.writeUrchinApiKey`, hot-swaps `urchinCache`, clears auth-warning latch, log scrubs the key body.
+  - `AX-status` readout gains `urchin=on/off`.
+  - `AX-help` gains a line for `AX-urchin <key>`.
+  - `AX-check <name>` dumps a new `urchin:` line with the same hover-tooltip treatment Seraph gets.
+- `CLAUDE.md` — add `urchinApiKey` to the global-config list, `AX-urchin` + `AX-check`'s new urchin leg to the commands list.
+
+**Unchanged by design:**
+- `SeraphClient` / `SeraphCache` / `SeraphData` — parallel copies, not abstracted. Two API integrations with diverging auth shapes (Seraph header, Urchin query param) and diverging error semantics don't justify a base class yet. Revisit if a third blacklist lands.
+- `TabRenderer`, `ColorTier` — no changes; `urchin` is just another cell string.
+- `SeraphTag` — reused as-is for Urchin's tags (Cubelify format is source-agnostic). If Urchin's tag shape turns out to diverge, rename `SeraphTag` → `CubelifyTag` in its own commit.
+
+**Rendering & alerts:**
+- `tag` column stays Seraph-only (preserves M15 behavior, minimum risk).
+- `urchin` column is additive — users opt in by adding `"urchin"` to `modes/<mode>.json > columns`.
+- Single-source alerts fire independently and look the same as today's Seraph alerts (just with `[Urchin]` prefix on the reason).
+- Double-source corroboration alert is the *one* new alert shape and the whole point of the milestone — fires bold red when both sources agree.
+
+**Security:**
+- Urchin puts the API key in the query string. Any log line that would otherwise include the URL must strip / mask the `key=` parameter first. Centralize in `UrchinClient.maskKeyForLog(String url)`.
+- `AX-urchin <key>` body is scrubbed before being written to `agent.log` — same pattern as `AX-seraph`.
+
+**Verification:**
+1. Build: `./gradlew :agent:build`. No new warnings.
+2. Config: delete `%APPDATA%\Aurex\config.json`, relaunch, confirm `urchinApiKey: ""` regenerates in default.
+3. Empty-key path: tab renders exactly as pre-M17.
+4. Key path: `AX-urchin <key>`, add `"urchin"` to `modes/bedwars.json > columns`, `AX-mode bedwars` to hot-reload, queue Bedwars, confirm urchin column populates and `agent.log` shows `urchin: <uuid> -> tags=N (Nms)` per player.
+5. Bad key: one red `API key rejected` line, no 403 spam.
+6. Double-flag: `AX-check` a UUID known to both blacklists — expect the bold promoted alert and no duplicate single-source alerts for that player.
+7. Key masking: grep `agent.log` for the raw key string — zero hits.
+8. `AX-urchin` hot-swap: revoke key, see warning, run `AX-urchin <newkey>`, next lookup works without restart.
+
+**Out of scope / deferred:**
+- WebSocket `/snipers` live feed.
+- Historical stats endpoint (admin-gated).
+- Batch `/players` endpoint (use single-UUID lookups; cache dedup already collapses bursts).
+- Using Urchin's `score.value` / `score.mode` fields — interesting for sort-by-suspiciousness UX, but V1 treats them as opaque.
+- Unifying `SeraphClient` / `UrchinClient` behind a shared interface. Revisit if a third blacklist API shows up.
+- Per-source column merging (single `threats` column with mixed Seraph+Urchin entries) — easy later if users prefer one column over two.
+
+**Success check:** In a Bedwars lobby with a known double-flagged cheater, both `tag` and `urchin` cells populate with independent reasons, the bold double-flag alert fires once, and `AX-check <name>` prints both `seraph:` and `urchin:` lines with hover tooltips.
 
 ---
 

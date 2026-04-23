@@ -60,6 +60,8 @@ public final class Config {
     public static final String COL_WINSTREAK = "winstreak";
     public static final String COL_KDR       = "kdr";
     public static final String COL_BBLR      = "bblr";
+    /** M15 — Seraph Cubelify blacklist/bot/member tag, first-wins. Empty when Seraph has no flags. */
+    public static final String COL_TAG       = "tag";
 
     private static final Set<String> VALID_COLUMNS;
     private static final Set<String> RECOGNIZED_KEYS;
@@ -69,10 +71,11 @@ public final class Config {
         valid.add(COL_WL);     valid.add(COL_WINS);      valid.add(COL_HEALTH);
         valid.add(COL_FINALS); valid.add(COL_BEDS);      valid.add(COL_WINSTREAK);
         valid.add(COL_KDR);    valid.add(COL_BBLR);
+        valid.add(COL_TAG);
         VALID_COLUMNS = Collections.unmodifiableSet(valid);
 
         LinkedHashSet<String> keys = new LinkedHashSet<String>(Arrays.asList(
-                "apiKey", "activeMode", "nickDetection", "chatAlerts", "ignoreList"));
+                "apiKey", "seraphApiKey", "activeMode", "nickDetection", "chatAlerts", "ignoreList"));
         RECOGNIZED_KEYS = Collections.unmodifiableSet(keys);
     }
 
@@ -96,6 +99,16 @@ public final class Config {
     // --- instance --------------------------------------------------------
 
     public final String apiKey;
+    /**
+     * Seraph API key for the M15 cheater-flag / client-tag integration. {@code
+     * null} when unset — in that case {@link com.aurex.agent.AgentImpl} runs
+     * without Seraph entirely (no network traffic, empty tag/client columns).
+     *
+     * <p>Lives in the global config because the key is identity-scoped, not
+     * per-mode. Rotated via the {@code AX-seraph <key>} chat command
+     * ({@link #writeSeraphApiKey}).
+     */
+    public final String seraphApiKey;
     public final String activeMode;
     public final boolean nickDetection;
     public final boolean chatAlerts;
@@ -123,11 +136,12 @@ public final class Config {
     /** Passthrough from {@link #modeConfig} — stars threat threshold for the active mode. */
     public final int starsThreshold;
 
-    private Config(String apiKey, String activeMode,
+    private Config(String apiKey, String seraphApiKey, String activeMode,
                    boolean nickDetection, boolean chatAlerts,
                    Set<String> ignoreList,
                    ModeConfig modeConfig, List<String> issues) {
         this.apiKey = apiKey;
+        this.seraphApiKey = seraphApiKey;
         this.activeMode = activeMode;
         this.nickDetection = nickDetection;
         this.chatAlerts = chatAlerts;
@@ -157,9 +171,11 @@ public final class Config {
         boolean nickDetection = true;
         boolean chatAlerts = true;
         Set<String> ignoreList = Collections.emptySet();
+        String seraphApiKey = null;
 
         if (root != null) {
             if (apiKey == null) apiKey = readString(root, "apiKey", issues);
+            seraphApiKey = readString(root, "seraphApiKey", issues);
             String modeStr = readString(root, "activeMode", issues);
             if (modeStr != null) {
                 String norm = modeStr.toLowerCase();
@@ -196,7 +212,7 @@ public final class Config {
 
         ModeConfig modeConfig = ModeConfig.load(activeMode, issues);
 
-        return new Config(apiKey, activeMode, nickDetection, chatAlerts,
+        return new Config(apiKey, seraphApiKey, activeMode, nickDetection, chatAlerts,
                 ignoreList, modeConfig, Collections.unmodifiableList(issues));
     }
 
@@ -223,6 +239,37 @@ public final class Config {
             }
             if (root == null) root = buildDefaultGlobalJson();
             root.addProperty("activeMode", mode);
+            String pretty = new GsonBuilder().setPrettyPrinting().create().toJson(root);
+            Files.write(path, pretty.getBytes(StandardCharsets.UTF_8));
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Update {@code seraphApiKey} in {@code config.json} without clobbering
+     * other fields. Called from the {@code AX-seraph <key>} chat command.
+     * Accepts empty string to clear.
+     *
+     * <p>Returns {@code true} on success; {@code false} on any I/O or parse
+     * failure (caller surfaces the error in chat).
+     */
+    public static boolean writeSeraphApiKey(String key) {
+        String normalized = key == null ? "" : key.trim();
+        Path path = resolveConfigPath();
+        if (path == null) return false;
+        try {
+            if (path.getParent() != null) Files.createDirectories(path.getParent());
+            JsonObject root = null;
+            if (Files.exists(path)) {
+                try (Reader r = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+                    JsonElement el = JsonParser.parseReader(r);
+                    if (el != null && el.isJsonObject()) root = el.getAsJsonObject();
+                }
+            }
+            if (root == null) root = buildDefaultGlobalJson();
+            root.addProperty("seraphApiKey", normalized);
             String pretty = new GsonBuilder().setPrettyPrinting().create().toJson(root);
             Files.write(path, pretty.getBytes(StandardCharsets.UTF_8));
             return true;
@@ -268,6 +315,7 @@ public final class Config {
     private static JsonObject buildDefaultGlobalJson() {
         JsonObject o = new JsonObject();
         o.addProperty("apiKey", "");
+        o.addProperty("seraphApiKey", "");
         o.addProperty("activeMode", DEFAULT_MODE);
         o.addProperty("nickDetection", true);
         o.addProperty("chatAlerts", true);

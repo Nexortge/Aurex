@@ -5,6 +5,9 @@ import com.aurex.agent.api.ColorTier;
 import com.aurex.agent.api.Config;
 import com.aurex.agent.api.HypixelClient;
 import com.aurex.agent.api.ModeConfig;
+import com.aurex.agent.api.SeraphCache;
+import com.aurex.agent.api.SeraphClient;
+import com.aurex.agent.api.SeraphData;
 import com.aurex.agent.api.StatsCache;
 
 import java.lang.reflect.Method;
@@ -83,6 +86,20 @@ public final class AgentImpl {
     private static final StatsCache statsCache = initStatsCache();
 
     /**
+     * M15 Seraph pipeline. {@code null} until a {@code seraphApiKey} is
+     * configured. Non-final because {@link #reinitSeraphCache} swaps it when
+     * the user runs {@code AX-seraph <newkey>}.
+     */
+    private static volatile SeraphCache seraphCache = initSeraphCache(config.seraphApiKey);
+
+    /**
+     * One-shot per session: flips true the first time we emit the red
+     * "Seraph API key rejected" chat warning. Prevents repeating the warning
+     * every tab render when {@link SeraphCache#authFailed()} is sticky-true.
+     */
+    private static volatile boolean seraphAuthWarningFired = false;
+
+    /**
      * UUIDs we've already fired a "[AX] -> Name is nicked!" chat alert for.
      * Cleared on {@code AX-off} so a re-arm in the same lobby re-announces.
      *
@@ -90,6 +107,11 @@ public final class AgentImpl {
      * loader copies and static state doesn't cross between them.
      */
     private static final Set<UUID> alertedNicks = ConcurrentHashMap.newKeySet();
+
+    /** M15 — UUIDs we've already fired a cheater alert for this arm cycle. */
+    private static final Set<UUID> alertedCheaters = ConcurrentHashMap.newKeySet();
+    /** M15 — UUIDs we've already fired a bot alert for this arm cycle. */
+    private static final Set<UUID> alertedBots = ConcurrentHashMap.newKeySet();
 
     /**
      * UUIDs we've already logged as "skipped (NPC/info row)". Dedup'd so the
@@ -169,6 +191,40 @@ public final class AgentImpl {
             Agent.log("stats: init failed, running without stats: " + t);
             return null;
         }
+    }
+
+    /**
+     * Build the Seraph pipeline when {@code seraphApiKey} is non-null, else
+     * return {@code null} so all downstream call sites short-circuit. Called
+     * at startup with the initial key and re-run by {@link #reinitSeraphCache}
+     * when the user rotates via {@code AX-seraph <newkey>}.
+     */
+    private static SeraphCache initSeraphCache(String key) {
+        try {
+            if (key == null || key.isEmpty()) {
+                Agent.log("seraph: no API key; cheater/client columns will stay empty");
+                return null;
+            }
+            Agent.log("seraph: API key loaded; pipeline ready");
+            return new SeraphCache(new SeraphClient(key, Agent::log));
+        } catch (Throwable t) {
+            Agent.log("seraph: init failed, continuing without Seraph: " + t);
+            return null;
+        }
+    }
+
+    /**
+     * Rebuild the Seraph pipeline with a new key. Called reflectively from
+     * {@link Agent#onOutgoingChat}'s {@code AX-seraph} branch. Clears the
+     * session auth-warning latch so a fresh 403 can re-raise if the new key is
+     * also bad.
+     */
+    public static void reinitSeraphCache(String newKey) {
+        seraphCache = initSeraphCache(newKey);
+        seraphAuthWarningFired = false;
+        alertedCheaters.clear();
+        alertedBots.clear();
+        Agent.log("seraph: pipeline reinitialised (key=" + (newKey == null || newKey.isEmpty() ? "unset" : "set") + ")");
     }
 
     /**
@@ -341,14 +397,20 @@ public final class AgentImpl {
     }
 
     /**
-     * Drop the "we've already alerted for these UUIDs" set. Called from
+     * Drop the "we've already alerted for these UUIDs" sets. Called from
      * {@link Agent#disarm(boolean)} via reflection so the MC-loader copy of
      * Agent can reach this bootstrap-resident state without a compile-time
      * reference.
+     *
+     * <p>Name kept as {@code clearNickAlerts} for Agent's reflection path —
+     * expanded to drain the M15 cheater/bot sets too so a re-arm in the same
+     * lobby re-announces Seraph-flagged players alongside nicks.
      */
     public static void clearNickAlerts() {
         alertedNicks.clear();
         skippedNicks.clear();
+        alertedCheaters.clear();
+        alertedBots.clear();
     }
 
     /**
@@ -481,6 +543,335 @@ public final class AgentImpl {
      * Handle {@code AX-removeignore <name>} from chat. Symmetrical to
      * {@link #onAxIgnore(String)} but removes rather than adds. Case-insensitive.
      */
+    /**
+     * Handle {@code AX-seraph <key>} from chat. Validates a non-empty arg,
+     * persists the key via {@link Config#writeSeraphApiKey}, reloads config so
+     * {@link Config#seraphApiKey} reflects the new value, and rebuilds the
+     * {@link SeraphCache} via {@link #reinitSeraphCache} so subsequent tab
+     * renders hit Seraph with the new key.
+     *
+     * <p><b>Log scrubbing:</b> we never write the raw key to {@code agent.log}.
+     * The key's length is logged as a fingerprint so users can tell whether
+     * their input reached this handler without exposing the secret.
+     */
+    public static void onAxSeraph(String rest) {
+        try {
+            if (rest == null || rest.isEmpty()) {
+                Agent.sendClientChat(Agent.PREFIX + "§eusage: AX-seraph <key>",
+                        capturedMcLoader);
+                return;
+            }
+            String key = rest.trim();
+            if (!Config.writeSeraphApiKey(key)) {
+                Agent.sendClientChat(Agent.PREFIX + "§ccould not write config.json — check log",
+                        capturedMcLoader);
+                Agent.log("AX-seraph: writeSeraphApiKey failed (key length=" + key.length() + ")");
+                return;
+            }
+            Config fresh = Config.load();
+            config = fresh;
+            reinitSeraphCache(fresh.seraphApiKey);
+            Agent.sendClientChat(Agent.PREFIX + "§aSeraph key updated", capturedMcLoader);
+            Agent.log("AX-seraph: key updated (length=" + key.length() + ")");
+        } catch (Throwable t) {
+            Agent.log("onAxSeraph failed: " + t);
+        }
+    }
+
+    /**
+     * Agent-facing query for {@code AX-status} — true when the Seraph pipeline
+     * is live and hasn't auth-failed. Called reflectively by
+     * {@link Agent#onOutgoingChat}'s status branch.
+     */
+    public static boolean isSeraphEnabled() {
+        SeraphCache sc = seraphCache;
+        return sc != null && !sc.authFailed();
+    }
+
+    /**
+     * Handle {@code AX-check <name>} from chat — debug command that resolves
+     * the username via Mojang, fires Hypixel + Seraph lookups for the resolved
+     * UUID, and dumps the results to client chat. Useful for verifying that
+     * either pipeline is wired correctly without queueing into a real lobby.
+     *
+     * <p>Bypasses {@code fetchArmed} (the user explicitly asked for a fetch)
+     * and {@code displayEnabled} (debug should always work). Runs entirely on
+     * background threads; the user sees an immediate "checking…" line and the
+     * results lines once both futures settle (or after a 15s timeout).
+     */
+    public static void onAxCheck(String rest) {
+        try {
+            // Capture an MC-capable loader from the calling (chat-send) thread
+            // BEFORE we hop to commonPool — background threads' context loader
+            // can't resolve net.minecraft.* on its own. We probe the candidate
+            // before promoting it to capturedMcLoader so we never poison the
+            // cache with a loader that can't actually see MC.
+            adoptChatThreadMcLoader();
+
+            if (rest == null || rest.isEmpty()) {
+                Agent.sendClientChat(Agent.PREFIX + "§eusage: AX-check <name>", capturedMcLoader);
+                return;
+            }
+            if (!isValidUsername(rest)) {
+                Agent.sendClientChat(Agent.PREFIX + "§cinvalid name \"" + rest + "\"",
+                        capturedMcLoader);
+                return;
+            }
+            final String requested = rest;
+            final ClassLoader cl = capturedMcLoader;
+            Agent.sendClientChat(Agent.PREFIX + "§echecking " + requested + "...", cl);
+            // commonPool is fine here — single Mojang call + waiting on two
+            // futures whose work happens on their own client executors. The
+            // captured loader is passed explicitly so the result chat lines
+            // can resolve net.minecraft.* off-thread.
+            CompletableFuture.runAsync(() -> runAxCheck(requested, cl));
+        } catch (Throwable t) {
+            Agent.log("onAxCheck failed: " + t);
+        }
+    }
+
+    /**
+     * Promote the calling thread's context loader into {@link #capturedMcLoader}
+     * if it can actually resolve {@code net.minecraft.client.Minecraft}. Lets
+     * chat commands seed the loader before any tab/NPI walk has occurred —
+     * otherwise background-thread {@code sendClientChat} calls fail with
+     * {@code ClassNotFoundException} until the user opens tab.
+     */
+    private static void adoptChatThreadMcLoader() {
+        if (capturedMcLoader != null) return;
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        if (cl == null) return;
+        try {
+            Class.forName("net.minecraft.client.Minecraft", false, cl);
+            capturedMcLoader = cl;
+            Agent.log("adopted chat-thread MC loader: " + cl);
+        } catch (Throwable ignored) {
+            // Context loader isn't MC-capable — don't promote; sendClientChat
+            // will still try its own fallback chain.
+        }
+    }
+
+    private static void runAxCheck(String requestedName, ClassLoader mcLoader) {
+        try {
+            MojangResolution resolved = resolveUuidFromName(requestedName);
+            if (resolved == null) {
+                Agent.sendClientChat(Agent.PREFIX + "§c\"" + requestedName
+                        + "\" is not a Mojang account", mcLoader);
+                return;
+            }
+            UUID uuid = resolved.uuid;
+            String name = resolved.canonicalName;
+
+            CompletableFuture<BedwarsStats> hypixelFut =
+                    statsCache != null ? statsCache.get(uuid) : null;
+            SeraphCache sc = seraphCache;
+            CompletableFuture<SeraphData> seraphFut =
+                    (sc != null && !sc.authFailed()) ? sc.get(uuid) : null;
+
+            // Wait up to 15s on each — long enough that a slow Hypixel response
+            // doesn't make the user think we silently dropped the command, but
+            // bounded so the chat result actually shows up.
+            awaitQuietly(hypixelFut, 15);
+            awaitQuietly(seraphFut, 15);
+
+            Agent.sendClientChat(Agent.PREFIX + "§a" + name + " (" + uuid + ")", mcLoader);
+            for (String line : formatHypixelLines(hypixelFut, config)) {
+                Agent.sendClientChat(Agent.PREFIX + "  " + line, mcLoader);
+            }
+            sendSeraphLine(sc, seraphFut, mcLoader);
+            Agent.log("AX-check: " + name + " uuid=" + uuid);
+        } catch (Throwable t) {
+            Agent.log("runAxCheck(" + requestedName + ") failed: " + t);
+            Agent.sendClientChat(Agent.PREFIX + "§cAX-check failed: " + t.getMessage(), mcLoader);
+        }
+    }
+
+    /** Best-effort wait — swallows everything; we'll inspect the future's state afterwards. */
+    private static void awaitQuietly(CompletableFuture<?> fut, int seconds) {
+        if (fut == null) return;
+        try { fut.get(seconds, java.util.concurrent.TimeUnit.SECONDS); }
+        catch (Throwable ignored) { /* timeout / interrupt / failure all handled at format time */ }
+    }
+
+    /**
+     * Build the hypixel block of the AX-check output — one line for the state
+     * ({@code disabled} / {@code nick} / {@code lookup failed}), or multiple
+     * lines dumping every Bedwars stat the mode tracks with per-column color
+     * tiers applied from {@code cfg.colors}. Denominators (deaths, losses) have
+     * no tier ladder by convention and render in dim gray.
+     */
+    private static java.util.List<String> formatHypixelLines(CompletableFuture<BedwarsStats> fut, Config cfg) {
+        java.util.List<String> out = new java.util.ArrayList<String>();
+        if (fut == null) { out.add("hypixel: §7disabled (no key)"); return out; }
+        if (!fut.isDone()) { out.add("hypixel: §7timed out"); return out; }
+        if (fut.isCompletedExceptionally()) { out.add("hypixel: §clookup failed"); return out; }
+        BedwarsStats s = fut.getNow(null);
+        if (s == null) { out.add("hypixel: §4nick / no Bedwars data"); return out; }
+
+        String stars   = ColorTier.colorize(cfg.colors.get(Config.COL_STARS),     s.stars,      String.valueOf(s.stars));
+        String fkdr    = ColorTier.colorize(cfg.colors.get(Config.COL_FKDR),      s.fkdr,       String.format("%.2f", s.fkdr));
+        String kdr     = ColorTier.colorize(cfg.colors.get(Config.COL_KDR),       s.kdr,        String.format("%.2f", s.kdr));
+        String bblr    = ColorTier.colorize(cfg.colors.get(Config.COL_BBLR),      s.bblr,       String.format("%.2f", s.bblr));
+        String wlr     = ColorTier.colorize(cfg.colors.get(Config.COL_WL),        s.wlr,        String.format("%.2f", s.wlr));
+        String wins    = ColorTier.colorize(cfg.colors.get(Config.COL_WINS),      s.wins,       formatInt(s.wins));
+        String finals  = ColorTier.colorize(cfg.colors.get(Config.COL_FINALS),    s.finalKills, formatInt(s.finalKills));
+        String beds    = ColorTier.colorize(cfg.colors.get(Config.COL_BEDS),      s.bedsBroken, formatInt(s.bedsBroken));
+        String ws      = s.winstreak == null
+                ? "§8hidden"
+                : ColorTier.colorize(cfg.colors.get(Config.COL_WINSTREAK), s.winstreak, formatInt(s.winstreak));
+
+        // Paired denominators render gray; the ratio column already colorized
+        // the value that matters.
+        String fd    = "§8" + formatInt(s.finalDeaths);
+        String rk    = "§8" + formatInt(s.regularKills);
+        String rd    = "§8" + formatInt(s.regularDeaths);
+        String bl    = "§8" + formatInt(s.bedsLost);
+        String losses= "§8" + formatInt(s.losses);
+
+        out.add("hypixel: §f✫" + stars);
+        out.add("  FKDR=" + fkdr + " §7(§f" + formatInt(s.finalKills) + "§8/" + fd + "§7)  "
+              + "KDR=" + kdr + " §7(" + rk + "§8/" + rd + "§7)");
+        out.add("  BBLR=" + bblr + " §7(§f" + formatInt(s.bedsBroken) + "§8/" + bl + "§7)  "
+              + "W/L=" + wlr + " §7(§f" + formatInt(s.wins) + "§8/" + losses + "§7)");
+        out.add("  finals=" + finals + "  beds=" + beds + "  wins=" + wins + "  WS=" + ws);
+        return out;
+    }
+
+    /**
+     * Send the AX-check seraph line with per-tag hover tooltips showing each
+     * tag's {@code tooltip} field. Falls back to a plain chat line for all the
+     * non-tag states (disabled / no fetch / auth failed / clean / etc.).
+     */
+    private static void sendSeraphLine(SeraphCache sc, CompletableFuture<SeraphData> fut, ClassLoader mcLoader) {
+        String prefix = Agent.PREFIX + "  seraph: ";
+        if (sc == null)                           { Agent.sendClientChat(prefix + "§7disabled (no key)", mcLoader); return; }
+        if (sc.authFailed())                      { Agent.sendClientChat(prefix + "§cauth failed (run AX-seraph <newkey>)", mcLoader); return; }
+        if (fut == null)                          { Agent.sendClientChat(prefix + "§7no fetch", mcLoader); return; }
+        if (!fut.isDone())                        { Agent.sendClientChat(prefix + "§7timed out", mcLoader); return; }
+        if (fut.isCompletedExceptionally())       { Agent.sendClientChat(prefix + "§clookup failed", mcLoader); return; }
+        SeraphData d = fut.getNow(null);
+        if (d == null)                            { Agent.sendClientChat(prefix + "§7no data", mcLoader); return; }
+        if (d.tags == null || d.tags.isEmpty())   { Agent.sendClientChat(prefix + "§aclean", mcLoader); return; }
+
+        // Build segment array: [prefix, null], [tag1, tooltip1], [", ", null], [tag2, tooltip2], ...
+        // Any null tooltip just renders that segment without a hover event.
+        int tagCount = d.tags.size();
+        String[][] segs = new String[1 + tagCount * 2 - 1][];
+        segs[0] = new String[] { prefix, null };
+        int si = 1;
+        for (int i = 0; i < tagCount; i++) {
+            SeraphData.SeraphTag t = d.tags.get(i);
+            if (i > 0) {
+                segs[si++] = new String[] { " §7, ", null };
+            }
+            String label = t.sectionColorCode + "[" + t.text + "]" + RESET;
+            String hover = buildTagHover(t);
+            segs[si++] = new String[] { label, hover };
+        }
+        Agent.sendClientChatWithHovers(segs, mcLoader);
+    }
+
+    /**
+     * Build the hover body for a Seraph tag. Combines the prettified tag name
+     * and tooltip when both are present; falls back to whichever exists.
+     * Returns {@code null} when neither is meaningful so the caller skips
+     * attaching a hover event.
+     */
+    private static String buildTagHover(SeraphData.SeraphTag t) {
+        String tt = t.tooltip == null ? "" : t.tooltip.trim();
+        String nm = prettifyTagName(t.tagName);
+        if (tt.isEmpty() && nm.isEmpty()) return null;
+        if (tt.isEmpty()) return "§f" + nm;
+        if (nm.isEmpty()) return "§f" + tt;
+        return "§f" + nm + "§r\n§7" + tt;
+    }
+
+    /**
+     * Turn Seraph's raw {@code tag_name} ({@code seraph.closet_cheating},
+     * {@code cubelify.bot}) into a human label ({@code Closet Cheating},
+     * {@code Bot}). Drops any namespace prefix before the last dot, swaps
+     * underscores/dashes for spaces, and title-cases each word.
+     */
+    private static String prettifyTagName(String raw) {
+        if (raw == null) return "";
+        String s = raw.trim();
+        if (s.isEmpty()) return "";
+        int dot = s.lastIndexOf('.');
+        if (dot >= 0 && dot < s.length() - 1) s = s.substring(dot + 1);
+        s = s.replace('_', ' ').replace('-', ' ').trim();
+        if (s.isEmpty()) return "";
+        StringBuilder out = new StringBuilder(s.length());
+        boolean startOfWord = true;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (Character.isWhitespace(c)) {
+                out.append(c);
+                startOfWord = true;
+            } else if (startOfWord) {
+                out.append(Character.toUpperCase(c));
+                startOfWord = false;
+            } else {
+                out.append(Character.toLowerCase(c));
+            }
+        }
+        return out.toString();
+    }
+
+    /** Result of a successful Mojang username → UUID lookup. */
+    private static final class MojangResolution {
+        final UUID uuid;
+        final String canonicalName;
+        MojangResolution(UUID uuid, String canonicalName) {
+            this.uuid = uuid;
+            this.canonicalName = canonicalName;
+        }
+    }
+
+    /**
+     * Synchronous Mojang username → UUID lookup. Returns {@code null} on 204
+     * / 404 (not a real account) or any transport failure. Caller is on a
+     * background thread (commonPool via {@link #onAxCheck}) — never call this
+     * from the render thread.
+     */
+    private static MojangResolution resolveUuidFromName(String name) {
+        java.net.HttpURLConnection conn = null;
+        try {
+            java.net.URL url = new java.net.URL(
+                    "https://api.mojang.com/users/profiles/minecraft/" + name);
+            conn = (java.net.HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("User-Agent", "Aurex/0.0.1");
+            conn.setConnectTimeout(5_000);
+            conn.setReadTimeout(10_000);
+            int code = conn.getResponseCode();
+            if (code == 204 || code == 404) return null;
+            if (code != 200) {
+                Agent.log("Mojang lookup '" + name + "' HTTP " + code);
+                return null;
+            }
+            try (java.io.Reader r = new java.io.InputStreamReader(
+                    conn.getInputStream(), java.nio.charset.StandardCharsets.UTF_8)) {
+                com.google.gson.JsonObject root =
+                        new com.google.gson.Gson().fromJson(r, com.google.gson.JsonObject.class);
+                if (root == null || !root.has("id") || !root.has("name")) return null;
+                String idHex = root.get("id").getAsString();
+                String canonicalName = root.get("name").getAsString();
+                if (idHex.length() != 32) return null;
+                String dashed = idHex.substring(0, 8) + "-"
+                        + idHex.substring(8, 12) + "-"
+                        + idHex.substring(12, 16) + "-"
+                        + idHex.substring(16, 20) + "-"
+                        + idHex.substring(20);
+                return new MojangResolution(UUID.fromString(dashed), canonicalName);
+            }
+        } catch (Throwable t) {
+            Agent.log("Mojang lookup '" + name + "' failed: " + t);
+            return null;
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
     public static void onAxRemoveIgnore(String rest) {
         try {
             if (rest == null || rest.isEmpty()) {
@@ -609,6 +1000,8 @@ public final class AgentImpl {
         if (npis == null || statsCache == null) return;
         try {
             int kicked = 0;
+            int seraphKicked = 0;
+            SeraphCache sc = seraphCache;
             for (Object npi : npis) {
                 if (npi == null) continue;
                 if (capturedMcLoader == null) capturedMcLoader = npi.getClass().getClassLoader();
@@ -628,8 +1021,16 @@ public final class AgentImpl {
                 // request started on a previous arm tick.
                 statsCache.get(uuid);
                 kicked++;
+                // Parallel Seraph pre-warm — same dedup semantics via SeraphCache.get.
+                // Skipped entirely when key is unset or session has auth-failed.
+                if (sc != null && !sc.authFailed() && sc.get(uuid) != null) {
+                    seraphKicked++;
+                }
             }
-            if (kicked > 0) Agent.log("preWarmFetches: kicked " + kicked + " fetch(es)");
+            if (kicked > 0) {
+                Agent.log("preWarmFetches: kicked " + kicked + " Hypixel, "
+                        + seraphKicked + " Seraph fetch(es)");
+            }
         } catch (Throwable t) {
             Agent.log("preWarmFetches failed: " + t);
         }
@@ -664,7 +1065,7 @@ public final class AgentImpl {
                     String rawName = name != null ? name : "";
                     String display = extractDisplayName(npi, rawName);
                     String teamKey = extractTeamKey(npi);
-                    raws.add(new RawRow(npi, uuid, rawName, display, teamKey, null, RowStatus.NPC, -1));
+                    raws.add(new RawRow(npi, uuid, rawName, display, teamKey, null, null, RowStatus.NPC, -1));
                     continue;
                 }
 
@@ -755,13 +1156,17 @@ public final class AgentImpl {
         final String displayName;
         final String teamKey;
         final BedwarsStats stats;   // null unless REAL
+        /** M15 — Seraph merged response. {@code null} if Seraph disabled, fetch in-flight, or failed. */
+        final SeraphData seraphData;
         final RowStatus status;
         final int health;           // 0-20 from scoreboard; -1 if untracked
         RawRow(Object npi, UUID uuid, String rawName, String displayName, String teamKey,
-               BedwarsStats stats, RowStatus status, int health) {
+               BedwarsStats stats, SeraphData seraphData, RowStatus status, int health) {
             this.npi = npi;
             this.uuid = uuid; this.rawName = rawName; this.displayName = displayName;
-            this.teamKey = teamKey; this.stats = stats; this.status = status;
+            this.teamKey = teamKey; this.stats = stats;
+            this.seraphData = seraphData;
+            this.status = status;
             this.health = health;
         }
     }
@@ -771,16 +1176,22 @@ public final class AgentImpl {
         String display = extractDisplayName(npi, rawName);
         String teamKey = extractTeamKey(npi);
 
+        // Seraph peek-and-maybe-fetch runs alongside Hypixel on every row so
+        // the two pipelines stay in sync — same fetch-armed gate, same in-flight
+        // dedup. A completed SeraphData can populate the tag/client cells even
+        // on NICK / PLACEHOLDER rows (a nicked cheater still gets called out).
+        SeraphData seraphData = peekOrFetchSeraph(uuid, rawName, fetchArmed, cfg);
+
         CompletableFuture<BedwarsStats> fut = statsCache.peekFuture(uuid);
         if (fut == null) {
             if (fetchArmed) {
                 statsCache.get(uuid);   // kick off async fetch
-                return new RawRow(npi, uuid, rawName, display, teamKey, null, RowStatus.PLACEHOLDER, health);
+                return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, RowStatus.PLACEHOLDER, health);
             }
-            return new RawRow(npi, uuid, rawName, display, teamKey, null, RowStatus.UNKNOWN, health);
+            return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, RowStatus.UNKNOWN, health);
         }
-        if (!fut.isDone()) return new RawRow(npi, uuid, rawName, display, teamKey, null, RowStatus.PLACEHOLDER, health);
-        if (fut.isCompletedExceptionally()) return new RawRow(npi, uuid, rawName, display, teamKey, null, RowStatus.UNKNOWN, health);
+        if (!fut.isDone()) return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, RowStatus.PLACEHOLDER, health);
+        if (fut.isCompletedExceptionally()) return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, RowStatus.UNKNOWN, health);
 
         BedwarsStats stats = fut.getNow(null);
         if (stats == null) {
@@ -789,7 +1200,7 @@ public final class AgentImpl {
             // row but skip the chat line. Alert dedup is shared with the
             // decorateInternal path via alertedNicks so we never double-fire.
             if (!cfg.nickDetection) {
-                return new RawRow(npi, uuid, rawName, display, teamKey, null, RowStatus.UNKNOWN, health);
+                return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, RowStatus.UNKNOWN, health);
             }
             if (alertedNicks.add(uuid)) {
                 Agent.log("nick detected (table): name='" + rawName + "' uuid=" + uuid);
@@ -798,9 +1209,79 @@ public final class AgentImpl {
                             capturedMcLoader);
                 }
             }
-            return new RawRow(npi, uuid, rawName, display, teamKey, null, RowStatus.NICK, health);
+            return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, RowStatus.NICK, health);
         }
-        return new RawRow(npi, uuid, rawName, display, teamKey, stats, RowStatus.REAL, health);
+        return new RawRow(npi, uuid, rawName, display, teamKey, stats, seraphData, RowStatus.REAL, health);
+    }
+
+    /**
+     * Resolve Seraph data for {@code uuid} on the render thread without
+     * blocking. Fires a fetch when armed + nothing cached; returns {@code null}
+     * while a fetch is in flight or if Seraph is disabled / auth-failed.
+     *
+     * <p>Also fires the one-shot cheater / bot chat alerts the first time a
+     * completed {@link SeraphData} with those flags walks past. Dedup is
+     * UUID-scoped via {@link #alertedCheaters} / {@link #alertedBots}; both
+     * sets reset on {@code AX-off} via {@link #clearNickAlerts}.
+     */
+    private static SeraphData peekOrFetchSeraph(UUID uuid, String rawName,
+                                                 boolean fetchArmed, Config cfg) {
+        SeraphCache sc = seraphCache;
+        if (sc == null) return null;
+        if (sc.authFailed()) {
+            maybeFireSeraphAuthWarning();
+            return null;
+        }
+        CompletableFuture<SeraphData> fut = sc.peekFuture(uuid);
+        if (fut == null) {
+            if (fetchArmed) sc.get(uuid);
+            return null;
+        }
+        if (!fut.isDone() || fut.isCompletedExceptionally()) return null;
+        SeraphData data = fut.getNow(null);
+        if (data == null) return null;
+        fireSeraphAlerts(uuid, rawName, data, cfg);
+        return data;
+    }
+
+    private static void fireSeraphAlerts(UUID uuid, String rawName, SeraphData data, Config cfg) {
+        if (!cfg.chatAlerts) return;
+        String name = (rawName != null && !rawName.isEmpty()) ? rawName : shortUuidName(uuid);
+        if (data.hasCheaterTag && alertedCheaters.add(uuid)) {
+            String reason = firstTagText(data);
+            Agent.log("seraph: CHEATER tagged name='" + name + "' uuid=" + uuid + " reason='" + reason + "'");
+            Agent.sendClientChat(Agent.PREFIX + "§4-> " + name
+                    + " is tagged: " + reason + RESET, capturedMcLoader);
+        }
+        if (data.hasBotTag && alertedBots.add(uuid)) {
+            Agent.log("seraph: BOT tagged name='" + name + "' uuid=" + uuid);
+            Agent.sendClientChat(Agent.PREFIX + "§e-> " + name
+                    + " is a bot" + RESET, capturedMcLoader);
+        }
+    }
+
+    /** Fallback name for alerts when rawName is missing — first 8 hex chars of the UUID. */
+    private static String shortUuidName(UUID uuid) {
+        String s = uuid.toString().replace("-", "");
+        return s.substring(0, 8);
+    }
+
+    private static String firstTagText(SeraphData data) {
+        if (data.tags == null || data.tags.isEmpty()) return "flagged";
+        SeraphData.SeraphTag t = data.tags.get(0);
+        return t.text == null ? "flagged" : t.text;
+    }
+
+    /**
+     * Emit the red "Seraph API key rejected" warning exactly once per session,
+     * the first frame after {@link SeraphCache#authFailed()} flips true.
+     */
+    private static void maybeFireSeraphAuthWarning() {
+        if (seraphAuthWarningFired) return;
+        seraphAuthWarningFired = true;
+        Agent.log("seraph: API key rejected (401/403) — suppressing further lookups until AX-seraph <newkey>");
+        Agent.sendClientChat(Agent.PREFIX + "§cSeraph API key rejected — run AX-seraph <key> to update" + RESET,
+                capturedMcLoader);
     }
 
     /**
@@ -868,6 +1349,11 @@ public final class AgentImpl {
         // fetching) can still render HP as long as the scoreboard objective
         // exists. Handle it before the status-switch.
         if (col.equals(Config.COL_HEALTH)) return formatHealth(r.health, cfg);
+
+        // M15 — tag cell is independent of Hypixel row status. A nicked player
+        // can still carry a cheater tag. Empty cell when Seraph is disabled,
+        // fetch in-flight, or no flags present.
+        if (col.equals(Config.COL_TAG)) return formatTag(r);
 
         switch (r.status) {
             case REAL: {
@@ -940,6 +1426,25 @@ public final class AgentImpl {
     private static String formatHealth(int hp, Config cfg) {
         if (hp < 0) return CELL_UNKNOWN;
         return ColorTier.colorize(cfg.colors.get(Config.COL_HEALTH), hp, String.valueOf(hp));
+    }
+
+    /**
+     * Seraph tag cell — first-wins from {@link SeraphData#tags}. Colors come
+     * straight from Seraph's Cubelify response, RGB-mapped to §-codes at parse
+     * time. NPC rows render blank (Seraph has no data on server entities); a
+     * PLACEHOLDER row with no Seraph data yet shows {@code [...]} to match the
+     * Hypixel loading state; REAL/NICK/UNKNOWN rows with no Seraph data show
+     * blank — either Seraph is disabled or the player is unflagged.
+     */
+    private static String formatTag(RawRow r) {
+        if (r.status == RowStatus.NPC) return "";
+        SeraphData d = r.seraphData;
+        if (d == null) {
+            return r.status == RowStatus.PLACEHOLDER ? CELL_PLACEHOLDER : "";
+        }
+        if (d.tags == null || d.tags.isEmpty()) return "";
+        SeraphData.SeraphTag t = d.tags.get(0);
+        return t.sectionColorCode + "[" + t.text + "]" + RESET;
     }
 
     /** 1234 → "1,234". Locale-agnostic, thousands separator only. */
