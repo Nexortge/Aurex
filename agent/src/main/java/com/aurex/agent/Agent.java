@@ -213,6 +213,8 @@ public final class Agent {
      */
     public static boolean renderAurexTab(int width) {
         try {
+            // M18: whitelist deny → fall through to vanilla tab.
+            if (isWhitelistDormant()) return false;
             if (!displayEnabled) return false;
             return TabRenderer.render(width);
         } catch (Throwable t) {
@@ -313,6 +315,20 @@ public final class Agent {
         try {
             if (message == null) return false;
             String trimmed = message.trim();
+
+            // M18: AX-whitelist-refresh is the ONE command that works even
+            // when the agent is dormant — it's the recovery path for a user
+            // who just got their UUID added to the allow-list and doesn't
+            // want to relaunch Lunar. Swallow before the dormant gate.
+            if (trimmed.equalsIgnoreCase("AX-whitelist-refresh")) {
+                onAxWhitelistRefresh();
+                return true;
+            }
+
+            // M18: dormant → let everything through to the server untouched.
+            // Don't swallow AX typos; user might have deliberately dropped back
+            // to vanilla chat and we don't want Aurex still eating their input.
+            if (isWhitelistDormant()) return false;
 
             if (trimmed.equalsIgnoreCase("AX-on")) {
                 arm();
@@ -438,6 +454,8 @@ public final class Agent {
      */
     public static void onIncomingChat(Object chatComponent) {
         try {
+            // M18: no auto-arm, no countdown matching, no side effects when dormant.
+            if (isWhitelistDormant()) return;
             if (chatComponent == null) return;
             String text = extractChatText(chatComponent);
             if (text == null) return;
@@ -580,6 +598,7 @@ public final class Agent {
         sendClientChat(PREFIX + "  §fAX-urchin <key> §8— rotate Urchin API key (hot-swap, no restart)");
         sendClientChat(PREFIX + "  §fAX-check <name> §8— debug: dump Hypixel + Seraph + Urchin for a player");
         sendClientChat(PREFIX + "  §fAX-debugtab <name> §8— splice a synthetic tab row for 10s (visual check)");
+        sendClientChat(PREFIX + "  §fAX-whitelist-refresh §8— force-refetch the access whitelist and re-evaluate");
     }
 
     /**
@@ -697,6 +716,61 @@ public final class Agent {
     }
 
     private static volatile Method implOnAxUrchinMethod;
+
+    /**
+     * Bridge for {@code AX-whitelist-refresh} into {@link AgentImpl} (M18).
+     * Clears the session verdict cache and re-evaluates the current player's
+     * UUID against a freshly-fetched snapshot — the in-game recovery path
+     * when the owner just added you (or just revoked someone). The MC copy
+     * of this class can't import {@link com.aurex.agent.access.Whitelist}
+     * directly because IchorPipeline doesn't delegate for our packages, so
+     * the bridge hops through bootstrap.
+     */
+    private static void onAxWhitelistRefresh() {
+        try {
+            Method m = implOnAxWhitelistRefreshMethod;
+            if (m == null) {
+                m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                        .getMethod("onAxWhitelistRefresh");
+                implOnAxWhitelistRefreshMethod = m;
+            }
+            m.invoke(null);
+        } catch (Throwable t) {
+            log("onAxWhitelistRefresh bridge failed: " + t);
+        }
+    }
+
+    private static volatile Method implOnAxWhitelistRefreshMethod;
+
+    /**
+     * Bridge for the M18 dormant flag. Hot-path — called from every
+     * {@link #renderAurexTab}, {@link #onOutgoingChat}, {@link #onIncomingChat}
+     * invocation, so the Method handle is cached in a volatile field after
+     * first resolution (same pattern as every other bridge here).
+     *
+     * <p>Fails open on reflection error: returning {@code false} keeps Aurex
+     * running normally if something is badly broken in bootstrap, because a
+     * runtime bug in the gate is NOT the authoritative deny path — an actual
+     * deny must come from {@link com.aurex.agent.access.Whitelist#check}
+     * flipping the flag. Defense-in-depth: a broken reflection path locking
+     * everyone out of their own tool would be worse than the missing gate.
+     */
+    private static boolean isWhitelistDormant() {
+        try {
+            Method m = whitelistIsDormantMethod;
+            if (m == null) {
+                m = Class.forName("com.aurex.agent.access.Whitelist", true, null)
+                        .getMethod("isDormant");
+                whitelistIsDormantMethod = m;
+            }
+            Object res = m.invoke(null);
+            return res instanceof Boolean && (Boolean) res;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static volatile Method whitelistIsDormantMethod;
 
     /**
      * Bridge for {@code AX-debugtab <name>} into {@link AgentImpl}. Mirrors
@@ -1156,9 +1230,10 @@ public final class Agent {
      * {@link #sendClientChat(String, ClassLoader)} — bootstrap's own search
      * won't resolve MC classes.
      *
-     * <p>Package-private so {@link DisarmTask} and {@link AgentImpl} can call it.
+     * <p>Public so {@link DisarmTask}, {@link AgentImpl}, and the
+     * cross-package {@link com.aurex.agent.access.Whitelist} can call it.
      */
-    static void sendClientChat(String text) {
+    public static void sendClientChat(String text) {
         sendClientChat(text, null);
     }
 
@@ -1170,7 +1245,7 @@ public final class Agent {
      * <p>Never throws — running on the render thread; a chat-send failure
      * must not bring down the frame.
      */
-    static void sendClientChat(String text, ClassLoader mcLoader) {
+    public static void sendClientChat(String text, ClassLoader mcLoader) {
         try {
             ClassLoader cl = mcLoader;
             if (cl == null) cl = Thread.currentThread().getContextClassLoader();
@@ -1270,8 +1345,15 @@ public final class Agent {
      * We write to a file, not System.out, because Lunar swallows stdout —
      * println lines from inside Lunar's JVM don't show up anywhere visible.
      * A file on disk is the reliable way to see that our code ran.
+     *
+     * <p>Public (not package-private) because cross-package callers like
+     * {@link com.aurex.agent.access.Whitelist} need it too — the API clients
+     * under {@code com.aurex.agent.api.*} take an injected {@code
+     * Consumer<String>}, but static-only helpers don't have a constructor to
+     * plumb one through, and a dedicated logger setter per helper is more
+     * ceremony than this one-keyword change.
      */
-    static void log(String message) {
+    public static void log(String message) {
         File file = logFile();
         File dir = file.getParentFile();
         if (dir != null && !dir.exists() && !dir.mkdirs()) {

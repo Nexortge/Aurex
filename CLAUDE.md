@@ -28,6 +28,7 @@ A Seraph-style stat overlay **injected into Lunar Client** (Minecraft 1.8.9) tha
 - Lunar per-user data: `C:\Users\nexor\.lunarclient\`
 - Our global config: `%APPDATA%\Aurex\config.json` — `apiKey`, `seraphApiKey`, `urchinApiKey`, `activeMode`, `nickDetection`, `chatAlerts`, `ignoreList`. Identity-scoped; doesn't change on mode switch.
 - Our per-mode configs: `%APPDATA%\Aurex\modes\<mode>.json` — `columns`, `colors`, `headers`, `alerts` (FKDR/stars threat thresholds). One file per game mode (`bedwars.json` ships first). Swapped wholesale via `AX-mode <name>`.
+- Whitelist cache: `%APPDATA%\Aurex\whitelist-cache.json` — last-known-good copy of the M18 access whitelist. Auto-refreshed from the gist on world-join; used as fallback when the network is unreachable.
 - Our log: `%APPDATA%\Aurex\agent.log`
 - Lunar main class (confirmed via `jps -l`): `com.moonsworth.lunar.genesis.Genesis`
 
@@ -41,6 +42,7 @@ A Seraph-style stat overlay **injected into Lunar Client** (Minecraft 1.8.9) tha
 - `AX-hypixel <key>` — rotate the Hypixel API key. Persists to `config.json`, hot-swaps the running `StatsCache` / `HypixelClient` without a restart, and fires a validation probe that reports pass/fail in chat. Raw key is never logged.
 - `AX-seraph <key>` — rotate the Seraph API key. Persists to `config.json`, hot-swaps the running `SeraphCache` without a restart. Raw key is never logged.
 - `AX-urchin <key>` — rotate the Urchin API key (M17 second-opinion blacklist). Persists to `config.json`, hot-swaps the running `UrchinCache` without a restart. Raw key is never logged.
+- `AX-whitelist-refresh` — force-refetch the M18 access whitelist and re-evaluate the current player's UUID. Mid-session recovery path when the owner just added/revoked a friend; avoids a Lunar relaunch. Works even when the agent is dormant (only command that does).
 - `AX-check <name>` — debug: Mojang username → UUID, fires Hypixel + Seraph + Urchin lookups for that UUID, dumps the results in client chat. Bypasses arm/display gates so it works any time. Useful for verifying integration without queueing into a lobby.
 
 ## Project layout (planned)

@@ -12,6 +12,7 @@ import com.aurex.agent.api.StatsCache;
 import com.aurex.agent.api.UrchinCache;
 import com.aurex.agent.api.UrchinClient;
 import com.aurex.agent.api.UrchinData;
+import com.aurex.agent.access.Whitelist;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -437,6 +438,22 @@ public final class AgentImpl {
      */
     public static void onServerJoin() {
         try {
+            // M18: whitelist gate runs FIRST — before config reload, before any
+            // network traffic, before touching the MC world. On deny, the agent
+            // stays loaded (can't System.exit from inside Lunar's JVM) but all
+            // Agent-side hooks short-circuit via Whitelist.isDormant(). See
+            // com.aurex.agent.access.Whitelist for the full policy.
+            //
+            // handleJoinGame runs on MC's network thread, whose context loader
+            // can see MC classes — adopt it so fetchOwnUuid / sendClientChat
+            // work on the very first join (before any tab walk has seeded
+            // capturedMcLoader via a NetworkPlayerInfo).
+            adoptChatThreadMcLoader();
+            Whitelist.check(fetchOwnUuid(capturedMcLoader), capturedMcLoader);
+            if (Whitelist.isDormant()) {
+                return;
+            }
+
             String oldKey = config.apiKey;
             Config fresh = Config.load();
             config = fresh;
@@ -839,6 +856,25 @@ public final class AgentImpl {
             rebuildHypixelPipeline(capturedMcLoader);
         } catch (Throwable t) {
             Agent.log("onAxHypixel failed: " + t);
+        }
+    }
+
+    /**
+     * Handle {@code AX-whitelist-refresh} from chat (M18). Clears the session
+     * verdict + dedup caches inside {@link Whitelist} and re-evaluates the
+     * current UUID against a freshly-fetched snapshot — lets a just-revoked
+     * account be denied mid-session without a Lunar relaunch.
+     *
+     * <p>Thin wrapper: {@link Whitelist#forceRefresh} owns the actual fetch,
+     * chat confirmations, and dormant-flag flip.
+     */
+    public static void onAxWhitelistRefresh() {
+        try {
+            adoptChatThreadMcLoader();
+            UUID uuid = fetchOwnUuid(capturedMcLoader);
+            Whitelist.forceRefresh(uuid, capturedMcLoader);
+        } catch (Throwable t) {
+            Agent.log("onAxWhitelistRefresh failed: " + t);
         }
     }
 
