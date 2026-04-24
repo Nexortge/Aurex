@@ -44,7 +44,7 @@ public final class HypixelClient {
     private static final String ENDPOINT = "https://api.hypixel.net/v2/player?uuid=";
     private static final int CONNECT_TIMEOUT_MS = 5_000;
     private static final int READ_TIMEOUT_MS = 10_000;
-    private static final String USER_AGENT = "Aurex/0.0.1 (+github:aurex)";
+    private static final String USER_AGENT = com.aurex.agent.Version.USER_AGENT;
 
     private final String apiKey;
     private final RateLimiter limiter;

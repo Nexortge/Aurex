@@ -454,6 +454,10 @@ public final class AgentImpl {
                 return;
             }
 
+            // M19: one yellow "update available" reminder per JVM run.
+            // Background thread; never throws; silent on network failure.
+            UpdateCheck.maybeAnnounceOnce(capturedMcLoader);
+
             String oldKey = config.apiKey;
             Config fresh = Config.load();
             config = fresh;
@@ -1409,7 +1413,7 @@ public final class AgentImpl {
                     "https://api.mojang.com/users/profiles/minecraft/" + name);
             conn = (java.net.HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
-            conn.setRequestProperty("User-Agent", "Aurex/0.0.1");
+            conn.setRequestProperty("User-Agent", Version.USER_AGENT);
             conn.setConnectTimeout(5_000);
             conn.setReadTimeout(10_000);
             int code = conn.getResponseCode();

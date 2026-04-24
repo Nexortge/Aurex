@@ -82,6 +82,18 @@ After any `./gradlew :agent:build`, just restart Lunar — the jar path doesn't 
 
 **Verify it ran:** tail `%APPDATA%\Aurex\agent.log`. Every Lunar launch appends a `hello from inside Lunar (premain)` line with a timestamp.
 
+## Cutting a release (M19+)
+
+Friend-facing installs pull from GitHub Releases via `install.ps1`. To cut a new version:
+
+1. Bump `VERSION` in `agent/src/main/java/com/aurex/agent/Version.java`.
+2. Update `version.txt` at the repo root to match. The agent fetches this on world-join and surfaces an "update available" reminder in chat when it differs from its own `Version.VERSION`.
+3. `./gradlew :agent:build`.
+4. Commit (both files) and push to `main`.
+5. `gh release create v<X.Y.Z> agent/build/libs/aurex-agent.jar --title v<X.Y.Z>`.
+
+Users re-run the `irm ... | iex` one-liner to pick up the new jar. The in-game reminder nudges them.
+
 ## Architecture principles
 
 1. **Two jars, two JVMs.** Loader is tiny and uses JDK's `tools.jar`. Agent is the thing that actually does work.

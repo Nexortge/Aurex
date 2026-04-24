@@ -63,7 +63,7 @@ public final class Whitelist {
     private static final int READ_TIMEOUT_MS = 10_000;
     private static final long ONE_DAY_MS = 24L * 60L * 60L * 1000L;
     private static final long SEVEN_DAYS_MS = 7L * ONE_DAY_MS;
-    private static final String USER_AGENT = "Aurex/0.0.1 (+github:aurex)";
+    private static final String USER_AGENT = com.aurex.agent.Version.USER_AGENT;
     private static final String CACHE_FILE = "whitelist-cache.json";
 
     enum Verdict { ALLOW, DENY }

@@ -51,7 +51,7 @@ public final class UrchinClient {
     private static final String ENDPOINT = "https://urchin.ws/cubelify";
     private static final int CONNECT_TIMEOUT_MS = 5_000;
     private static final int READ_TIMEOUT_MS = 10_000;
-    private static final String USER_AGENT = "Aurex/0.0.1 (+github:aurex)";
+    private static final String USER_AGENT = com.aurex.agent.Version.USER_AGENT;
     private static final String SOURCES = "GAME,MANUAL";
 
     private final String apiKey;
