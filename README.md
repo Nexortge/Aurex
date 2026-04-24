@@ -2,6 +2,10 @@
 
 A Seraph-style stat overlay for **Hypixel Bedwars**, injected into **Lunar Client 1.8.9**. Replaces the vanilla tab list with a columnar stats table (FKDR, stars, winstreak, W/L, etc.) pulled from the Hypixel API, and flags cheaters by cross-referencing the Seraph and Urchin community blacklists.
 
+## Disclaimer — please read before installing
+
+> **Use at your own risk.** Aurex is a prototype. Stat overlays are a **grey area on Hypixel** — not explicitly banned, not officially sanctioned, and a ruleset change could retroactively flag users. Custom Java agents are more clearly against **Lunar Client's ToS**. The author didn't write every line by hand — much of the code is AI-assisted and may do things that weren't intended. **Expect bugs**, edge cases, and unexpected behavior. No warranty, no support guarantees; if this gets your account banned, bricks something, or misbehaves in any way, that's on you for choosing to run it. If you hit a bug, open an issue — but the code quality reflects "it works on my machine," not "production-grade."
+
 ## What it does
 
 - Replaces Lunar's tab list with a configurable stats table while you're in a Bedwars lobby or game.
@@ -53,13 +57,12 @@ Requires **JDK 8** (Lunar 1.8.9 runs on JVM 8; newer bytecode won't load).
 
 Output: `agent/build/libs/aurex-agent.jar`.
 
-## Caveats
+## Scope
 
-- **This violates Lunar Client and Hypixel's Terms of Service.** Use at your own risk — accounts can be banned.
 - **Windows only** for now. The agent code itself is portable, but the installer and paths are Windows-specific.
 - **Bedwars only** at V1. SkyWars and Duels are planned but not shipped.
 - **Access is gated by the owner.** If you see a red "not authorized" line in chat after install, the build isn't running on your account. DM the owner for access.
 
-## Code quality disclaimer
+## Code orientation
 
-This is **mostly vibecoded**. It works, and it's been tested in-game, but it's not a model of Java craftsmanship — expect duplicated patterns, pragmatic error handling, and comments that explain the weird reflection dances rather than the obvious stuff. The architecture notes in `CLAUDE.md` and the milestone breakdown in `PLAN.md` are the best way to get oriented. Cleanup PRs welcome.
+The architecture notes in `CLAUDE.md` and the milestone breakdown in `PLAN.md` are the best way to get oriented if you want to read the code. Cleanup PRs welcome — expect duplicated patterns, pragmatic error handling, and comments that explain the weird reflection dances rather than the obvious stuff.
