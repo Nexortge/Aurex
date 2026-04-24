@@ -58,6 +58,17 @@ public final class RateLimiter {
     }
 
     /**
+     * Defaults: 60 req/min, burst of 16. Urchin's published ceiling is looser
+     * than Seraph's but we stay conservative for now — a 100-player lobby
+     * pre-warm burst ({@code preWarmFetches}) needs headroom on top of whatever
+     * the user has running in parallel in a browser mod. Revisit once we see
+     * real {@code x-ratelimit-*} headers on live traffic.
+     */
+    public static RateLimiter defaultUrchin() {
+        return new RateLimiter(60, 16);
+    }
+
+    /**
      * Block until a single token is available, then consume it.
      * <p>Sleeps outside the lock so other threads can still refill + acquire
      * concurrently. May still take multiple iterations if many threads contend

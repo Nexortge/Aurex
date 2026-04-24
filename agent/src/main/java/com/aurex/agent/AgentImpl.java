@@ -9,6 +9,9 @@ import com.aurex.agent.api.SeraphCache;
 import com.aurex.agent.api.SeraphClient;
 import com.aurex.agent.api.SeraphData;
 import com.aurex.agent.api.StatsCache;
+import com.aurex.agent.api.UrchinCache;
+import com.aurex.agent.api.UrchinClient;
+import com.aurex.agent.api.UrchinData;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -120,6 +123,28 @@ public final class AgentImpl {
     private static volatile boolean seraphAuthWarningFired = false;
 
     /**
+     * M17 Urchin pipeline. {@code null} until a {@code urchinApiKey} is
+     * configured. Non-final because {@link #reinitUrchinCache} swaps it when
+     * the user runs {@code AX-urchin <newkey>}.
+     */
+    private static volatile UrchinCache urchinCache = initUrchinCache(config.urchinApiKey);
+
+    /**
+     * One-shot per session: flips true the first time we emit the red
+     * "Urchin API key rejected" chat warning. Mirrors
+     * {@link #seraphAuthWarningFired}.
+     */
+    private static volatile boolean urchinAuthWarningFired = false;
+
+    /**
+     * Active {@code AX-debugtab} entry, or {@code null}. Populated by
+     * {@link #onAxDebugTab} after fetches resolve; spliced into the tab by
+     * {@link #getTabData} until {@code expiresAtNanos} passes. Single-slot —
+     * running AX-debugtab again overwrites whatever's there.
+     */
+    private static volatile DebugTabEntry debugTabEntry;
+
+    /**
      * UUIDs we've already fired a "[AX] -> Name is nicked!" chat alert for.
      * Cleared on {@code AX-off} so a re-arm in the same lobby re-announces.
      *
@@ -128,10 +153,20 @@ public final class AgentImpl {
      */
     private static final Set<UUID> alertedNicks = ConcurrentHashMap.newKeySet();
 
-    /** M15 — UUIDs we've already fired a cheater alert for this arm cycle. */
+    /** M15 — UUIDs we've already fired a Seraph cheater alert for this arm cycle. */
     private static final Set<UUID> alertedCheaters = ConcurrentHashMap.newKeySet();
-    /** M15 — UUIDs we've already fired a bot alert for this arm cycle. */
+    /** M15 — UUIDs we've already fired a Seraph bot alert for this arm cycle. */
     private static final Set<UUID> alertedBots = ConcurrentHashMap.newKeySet();
+    /** M17 — UUIDs we've already fired an Urchin cheater alert for this arm cycle. */
+    private static final Set<UUID> alertedUrchinCheaters = ConcurrentHashMap.newKeySet();
+    /** M17 — UUIDs we've already fired an Urchin bot alert for this arm cycle. */
+    private static final Set<UUID> alertedUrchinBots = ConcurrentHashMap.newKeySet();
+    /**
+     * M17 — UUIDs we've already fired the promoted "both sources flagged" line
+     * for. Replaces both the seraph + urchin single-source cheater alerts for
+     * that player while active.
+     */
+    private static final Set<UUID> alertedDoubleFlags = ConcurrentHashMap.newKeySet();
 
     /**
      * UUIDs we've already logged as "skipped (NPC/info row)". Dedup'd so the
@@ -342,7 +377,42 @@ public final class AgentImpl {
         seraphAuthWarningFired = false;
         alertedCheaters.clear();
         alertedBots.clear();
+        alertedDoubleFlags.clear();
         Agent.log("seraph: pipeline reinitialised (key=" + (newKey == null || newKey.isEmpty() ? "unset" : "set") + ")");
+    }
+
+    /**
+     * Build the Urchin pipeline when {@code urchinApiKey} is non-null, else
+     * return {@code null} so all downstream call sites short-circuit. Parallel
+     * to {@link #initSeraphCache}.
+     */
+    private static UrchinCache initUrchinCache(String key) {
+        try {
+            if (key == null || key.isEmpty()) {
+                Agent.log("urchin: no API key; urchin column will stay empty");
+                return null;
+            }
+            Agent.log("urchin: API key loaded; pipeline ready");
+            return new UrchinCache(new UrchinClient(key, Agent::log));
+        } catch (Throwable t) {
+            Agent.log("urchin: init failed, continuing without Urchin: " + t);
+            return null;
+        }
+    }
+
+    /**
+     * Rebuild the Urchin pipeline with a new key. Called reflectively from
+     * {@link Agent#onOutgoingChat}'s {@code AX-urchin} branch. Clears the
+     * session auth-warning latch and alert dedup so a fresh 403 / fresh lobby
+     * can re-raise warnings / re-announce flagged players.
+     */
+    public static void reinitUrchinCache(String newKey) {
+        urchinCache = initUrchinCache(newKey);
+        urchinAuthWarningFired = false;
+        alertedUrchinCheaters.clear();
+        alertedUrchinBots.clear();
+        alertedDoubleFlags.clear();
+        Agent.log("urchin: pipeline reinitialised (key=" + (newKey == null || newKey.isEmpty() ? "unset" : "set") + ")");
     }
 
     /**
@@ -532,6 +602,9 @@ public final class AgentImpl {
         skippedNicks.clear();
         alertedCheaters.clear();
         alertedBots.clear();
+        alertedUrchinCheaters.clear();
+        alertedUrchinBots.clear();
+        alertedDoubleFlags.clear();
     }
 
     /**
@@ -700,6 +773,40 @@ public final class AgentImpl {
     }
 
     /**
+     * Handle {@code AX-urchin <key>} from chat. Parallel to {@link #onAxSeraph}:
+     * persists via {@link Config#writeUrchinApiKey}, reloads config, rebuilds
+     * the {@link UrchinCache} / {@link UrchinClient} in place via
+     * {@link #reinitUrchinCache} so subsequent tab renders hit Urchin with the
+     * new key.
+     *
+     * <p><b>Log scrubbing:</b> the raw key never touches {@code agent.log} —
+     * only its length fingerprints in the outcome line.
+     */
+    public static void onAxUrchin(String rest) {
+        try {
+            if (rest == null || rest.isEmpty()) {
+                Agent.sendClientChat(Agent.PREFIX + "§eusage: AX-urchin <key>",
+                        capturedMcLoader);
+                return;
+            }
+            String key = rest.trim();
+            if (!Config.writeUrchinApiKey(key)) {
+                Agent.sendClientChat(Agent.PREFIX + "§ccould not write config.json — check log",
+                        capturedMcLoader);
+                Agent.log("AX-urchin: writeUrchinApiKey failed (key length=" + key.length() + ")");
+                return;
+            }
+            Config fresh = Config.load();
+            config = fresh;
+            reinitUrchinCache(fresh.urchinApiKey);
+            Agent.sendClientChat(Agent.PREFIX + "§aUrchin key updated", capturedMcLoader);
+            Agent.log("AX-urchin: key updated (length=" + key.length() + ")");
+        } catch (Throwable t) {
+            Agent.log("onAxUrchin failed: " + t);
+        }
+    }
+
+    /**
      * Handle {@code AX-hypixel <key>} from chat. Parallel to {@link #onAxSeraph}:
      * persists via {@link Config#writeApiKey}, reloads config, rebuilds the
      * Hypixel {@link StatsCache} / {@link HypixelClient} in place via
@@ -743,6 +850,15 @@ public final class AgentImpl {
     public static boolean isSeraphEnabled() {
         SeraphCache sc = seraphCache;
         return sc != null && !sc.authFailed();
+    }
+
+    /**
+     * Agent-facing query for {@code AX-status} — true when the Urchin pipeline
+     * is live and hasn't auth-failed. Parallel to {@link #isSeraphEnabled}.
+     */
+    public static boolean isUrchinEnabled() {
+        UrchinCache uc = urchinCache;
+        return uc != null && !uc.authFailed();
     }
 
     /**
@@ -835,18 +951,23 @@ public final class AgentImpl {
             SeraphCache sc = seraphCache;
             CompletableFuture<SeraphData> seraphFut =
                     (sc != null && !sc.authFailed()) ? sc.get(uuid) : null;
+            UrchinCache uc = urchinCache;
+            CompletableFuture<UrchinData> urchinFut =
+                    (uc != null && !uc.authFailed()) ? uc.get(uuid, name) : null;
 
-            // Wait up to 15s on each — long enough that a slow Hypixel response
+            // Wait up to 15s on each — long enough that a slow response
             // doesn't make the user think we silently dropped the command, but
             // bounded so the chat result actually shows up.
             awaitQuietly(hypixelFut, 15);
             awaitQuietly(seraphFut, 15);
+            awaitQuietly(urchinFut, 15);
 
             Agent.sendClientChat(Agent.PREFIX + "§a" + name + " (" + uuid + ")", mcLoader);
             for (String line : formatHypixelLines(hc, hypixelFut, config)) {
                 Agent.sendClientChat(Agent.PREFIX + "  " + line, mcLoader);
             }
             sendSeraphLine(sc, seraphFut, mcLoader);
+            sendUrchinLine(uc, urchinFut, mcLoader);
             Agent.log("AX-check: " + name + " uuid=" + uuid);
         } catch (Throwable t) {
             Agent.log("runAxCheck(" + requestedName + ") failed: " + t);
@@ -859,6 +980,136 @@ public final class AgentImpl {
         if (fut == null) return;
         try { fut.get(seconds, java.util.concurrent.TimeUnit.SECONDS); }
         catch (Throwable ignored) { /* timeout / interrupt / failure all handled at format time */ }
+    }
+
+    /**
+     * {@code AX-debugtab <name>} — resolve {@code name} via Mojang, fire the
+     * same Hypixel + Seraph + Urchin lookups as {@code AX-check}, then inject
+     * a synthetic tab row carrying the results for 10 seconds. Lets the user
+     * eyeball the column formatting (especially the Urchin short-code badges)
+     * without having to queue into a lobby with a known flagged player.
+     *
+     * <p>Ignores the arm gate — works any time. Bypassing is intentional:
+     * this is a debug / visualization tool, not a gameplay feature.
+     */
+    public static void onAxDebugTab(String rest) {
+        try {
+            adoptChatThreadMcLoader();
+            if (rest == null || rest.isEmpty()) {
+                Agent.sendClientChat(Agent.PREFIX + "§eusage: AX-debugtab <name>", capturedMcLoader);
+                return;
+            }
+            if (!isValidUsername(rest)) {
+                Agent.sendClientChat(Agent.PREFIX + "§cinvalid name \"" + rest + "\"", capturedMcLoader);
+                return;
+            }
+            final String requested = rest;
+            final ClassLoader cl = capturedMcLoader;
+            Agent.sendClientChat(Agent.PREFIX + "§efetching debug tab for " + requested + "...", cl);
+            CompletableFuture.runAsync(() -> runAxDebugTab(requested, cl));
+        } catch (Throwable t) {
+            Agent.log("onAxDebugTab failed: " + t);
+        }
+    }
+
+    /** Debug-row lifetime once the entry is committed. Long enough to open tab, short enough to auto-clear. */
+    private static final long DEBUG_TAB_TTL_NANOS = 10L * 1_000_000_000L;
+
+    private static void runAxDebugTab(String requestedName, ClassLoader mcLoader) {
+        try {
+            MojangResolution resolved = resolveUuidFromName(requestedName);
+            if (resolved == null) {
+                Agent.sendClientChat(Agent.PREFIX + "§c\"" + requestedName
+                        + "\" is not a Mojang account", mcLoader);
+                return;
+            }
+            UUID uuid = resolved.uuid;
+            String name = resolved.canonicalName;
+
+            StatsCache hc = statsCache;
+            CompletableFuture<BedwarsStats> hypixelFut =
+                    (hc != null && !hc.authFailed()) ? hc.get(uuid) : null;
+            SeraphCache sc = seraphCache;
+            CompletableFuture<SeraphData> seraphFut =
+                    (sc != null && !sc.authFailed()) ? sc.get(uuid) : null;
+            UrchinCache uc = urchinCache;
+            CompletableFuture<UrchinData> urchinFut =
+                    (uc != null && !uc.authFailed()) ? uc.get(uuid, name) : null;
+
+            awaitQuietly(hypixelFut, 15);
+            awaitQuietly(seraphFut, 15);
+            awaitQuietly(urchinFut, 15);
+
+            BedwarsStats stats = peekDone(hypixelFut);
+            SeraphData seraphData = peekDone(seraphFut);
+            UrchinData urchinData = peekDone(urchinFut);
+
+            RowStatus status;
+            if (hc == null || hypixelFut == null || (hypixelFut.isDone() && hypixelFut.isCompletedExceptionally())) {
+                status = RowStatus.UNKNOWN;
+            } else if (stats == null) {
+                status = RowStatus.NICK;
+            } else {
+                status = RowStatus.REAL;
+            }
+
+            debugTabEntry = new DebugTabEntry(uuid, name, stats, seraphData, urchinData,
+                    status, System.nanoTime() + DEBUG_TAB_TTL_NANOS);
+            Agent.sendClientChat(Agent.PREFIX + "§adebug row active for 10s: " + name
+                    + " §7(status=" + status + ")", mcLoader);
+            Agent.log("AX-debugtab: " + name + " uuid=" + uuid + " status=" + status);
+        } catch (Throwable t) {
+            Agent.log("runAxDebugTab(" + requestedName + ") failed: " + t);
+            Agent.sendClientChat(Agent.PREFIX + "§cAX-debugtab failed: " + t.getMessage(), mcLoader);
+        }
+    }
+
+    /** Pull a future's result without blocking — null if not done, failed, or result itself is null. */
+    private static <T> T peekDone(CompletableFuture<T> fut) {
+        if (fut == null || !fut.isDone() || fut.isCompletedExceptionally()) return null;
+        return fut.getNow(null);
+    }
+
+    /**
+     * Debug tab entry — carries fetched stats until {@code expiresAtNanos}.
+     * Converted to a {@link RawRow} each frame by {@link #toRawRow}. Lives
+     * in a {@code volatile} single slot so AX-debugtab invocations replace
+     * each other atomically without needing a lock.
+     */
+    private static final class DebugTabEntry {
+        final UUID uuid;
+        final String name;
+        final BedwarsStats stats;
+        final SeraphData seraphData;
+        final UrchinData urchinData;
+        final RowStatus status;
+        final long expiresAtNanos;
+
+        DebugTabEntry(UUID uuid, String name, BedwarsStats stats,
+                      SeraphData seraphData, UrchinData urchinData,
+                      RowStatus status, long expiresAtNanos) {
+            this.uuid = uuid;
+            this.name = name;
+            this.stats = stats;
+            this.seraphData = seraphData;
+            this.urchinData = urchinData;
+            this.status = status;
+            this.expiresAtNanos = expiresAtNanos;
+        }
+
+        /**
+         * Build a {@link RawRow} suitable for the tab render path. {@code npi}
+         * is {@code null} on purpose — TabRenderer skips the head-icon draw
+         * when it sees a null, so the debug row renders all cells minus the
+         * skin head. {@code teamKey} uses a tilde-prefix so the entry sorts
+         * below any real Hypixel team grouping but still above NPCs (which
+         * are excluded from {@code raws} entirely).
+         */
+        RawRow toRawRow() {
+            String display = "§6[DEBUG] §f" + name;
+            return new RawRow(null, uuid, name, display, "~debug",
+                    stats, seraphData, urchinData, status, -1);
+        }
     }
 
     /**
@@ -939,6 +1190,118 @@ public final class AgentImpl {
             segs[si++] = new String[] { label, hover };
         }
         Agent.sendClientChatWithHovers(segs, mcLoader);
+    }
+
+    /**
+     * Send the AX-check urchin line with per-tag hover tooltips. Parallel to
+     * {@link #sendSeraphLine}. Tag label is the {@code icon} glyph with its
+     * Cubelify-mapped §-color; hover reveals the full {@code tooltip} text
+     * and the tag's {@code score} value.
+     */
+    private static void sendUrchinLine(UrchinCache uc, CompletableFuture<UrchinData> fut, ClassLoader mcLoader) {
+        String prefix = Agent.PREFIX + "  urchin: ";
+        if (uc == null)                           { Agent.sendClientChat(prefix + "§7disabled (no key)", mcLoader); return; }
+        if (uc.authFailed())                      { Agent.sendClientChat(prefix + "§cauth failed (run AX-urchin <newkey>)", mcLoader); return; }
+        if (fut == null)                          { Agent.sendClientChat(prefix + "§7no fetch", mcLoader); return; }
+        if (!fut.isDone())                        { Agent.sendClientChat(prefix + "§7timed out", mcLoader); return; }
+        if (fut.isCompletedExceptionally())       { Agent.sendClientChat(prefix + "§clookup failed", mcLoader); return; }
+        UrchinData d = fut.getNow(null);
+        if (d == null)                            { Agent.sendClientChat(prefix + "§7no data", mcLoader); return; }
+        List<UrchinData.UrchinTag> shown = displayableUrchinTags(d);
+        if (shown.isEmpty())                      { Agent.sendClientChat(prefix + "§aclean", mcLoader); return; }
+
+        int tagCount = shown.size();
+        String[][] segs = new String[1 + tagCount * 2 - 1][];
+        segs[0] = new String[] { prefix, null };
+        int si = 1;
+        for (int i = 0; i < tagCount; i++) {
+            UrchinData.UrchinTag t = shown.get(i);
+            if (i > 0) {
+                segs[si++] = new String[] { " §7, ", null };
+            }
+            String label = t.sectionColorCode + "[" + t.displayLabel + "]" + RESET;
+            String hover = buildUrchinTagHover(t);
+            segs[si++] = new String[] { label, hover };
+        }
+        Agent.sendClientChatWithHovers(segs, mcLoader);
+    }
+
+    /**
+     * Hover body for an Urchin tag. Matches Seraph's style:
+     * {@link UrchinData.UrchinTag#displayLabel} as a white title on line 1,
+     * the tooltip (plus optional score) in grey below. Returns {@code null}
+     * when there's nothing useful to render so the caller skips attaching a
+     * hover event.
+     *
+     * <p>Bullets ({@code •}) in Urchin tooltips become newlines so multi-part
+     * tooltips (ping: {@code "Time since last ping: 5d 11h ago • Total
+     * Average: 120ms"}) stack as separate lines. The tooltip is also run
+     * through {@link #sanitizeForMc} — Urchin sometimes ships emoji or
+     * Material-Design private-use codepoints that MC 1.8.9's font renders as
+     * box glyphs.
+     */
+    private static String buildUrchinTagHover(UrchinData.UrchinTag t) {
+        String tip = t.tooltip == null ? "" : t.tooltip.trim();
+        if (!tip.isEmpty()) {
+            tip = sanitizeForMc(tip).replace(" • ", "\n").replace("•", "\n").trim();
+        }
+        String label = t.displayLabel == null ? "" : sanitizeForMc(t.displayLabel).trim();
+        boolean hasScore = t.score != 0;
+        if (tip.isEmpty() && !hasScore && label.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder();
+        if (!label.isEmpty()) sb.append("§f").append(label);
+        if (!tip.isEmpty()) {
+            if (sb.length() > 0) sb.append("§r\n");
+            sb.append("§7").append(tip);
+        }
+        if (hasScore) {
+            if (sb.length() > 0) sb.append("§r\n");
+            sb.append("§7score: ").append(t.score);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Filter Urchin tags down to the ones we actually render. Whitelist of
+     * classification labels only — Sniper / Blatant / Closet / Confirmed /
+     * Bot. Everything else (Seen / KD / ping-ms / unknown icons) is dropped
+     * so clean players render an empty cell. Returns an empty list on
+     * null/empty input.
+     */
+    private static List<UrchinData.UrchinTag> displayableUrchinTags(UrchinData d) {
+        if (d == null || d.tags == null || d.tags.isEmpty()) return Collections.emptyList();
+        List<UrchinData.UrchinTag> out = new ArrayList<UrchinData.UrchinTag>(d.tags.size());
+        for (UrchinData.UrchinTag t : d.tags) {
+            if (!isClassificationLabel(t.displayLabel)) continue;
+            out.add(t);
+        }
+        return out;
+    }
+
+    private static boolean isClassificationLabel(String label) {
+        return "Sniper".equals(label)
+                || "Blatant".equals(label)
+                || "Closet".equals(label)
+                || "Confirmed".equals(label)
+                || "Bot".equals(label);
+    }
+
+    /**
+     * Drop characters MC 1.8.9's default font can't render. Keeps printable
+     * ASCII (0x20–0x7E), {@code §} (color codes), and {@code \n} (hover line
+     * breaks). Everything else — emoji, Material-Design private-use glyphs,
+     * Unicode arrows — is stripped. Never returns null.
+     */
+    private static String sanitizeForMc(String s) {
+        if (s == null || s.isEmpty()) return s == null ? "" : s;
+        StringBuilder out = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\n' || c == '§' || (c >= 0x20 && c <= 0x7E)) {
+                out.append(c);
+            }
+        }
+        return out.toString();
     }
 
     /**
@@ -1171,7 +1534,9 @@ public final class AgentImpl {
         try {
             int kicked = 0;
             int seraphKicked = 0;
+            int urchinKicked = 0;
             SeraphCache sc = seraphCache;
+            UrchinCache uc = urchinCache;
             for (Object npi : npis) {
                 if (npi == null) continue;
                 if (capturedMcLoader == null) capturedMcLoader = npi.getClass().getClassLoader();
@@ -1196,10 +1561,19 @@ public final class AgentImpl {
                 if (sc != null && !sc.authFailed() && sc.get(uuid) != null) {
                     seraphKicked++;
                 }
+                // Parallel Urchin pre-warm — same dedup, same auth gate. Needs
+                // the IGN because Urchin's query requires the name param;
+                // extractName hits the same cached reflection path that the
+                // tab renderer uses so the cost is negligible.
+                if (uc != null && !uc.authFailed()) {
+                    String ign = extractName(npi);
+                    if (ign != null && uc.get(uuid, ign) != null) urchinKicked++;
+                }
             }
             if (kicked > 0) {
                 Agent.log("preWarmFetches: kicked " + kicked + " Hypixel, "
-                        + seraphKicked + " Seraph fetch(es)");
+                        + seraphKicked + " Seraph, "
+                        + urchinKicked + " Urchin fetch(es)");
             }
         } catch (Throwable t) {
             Agent.log("preWarmFetches failed: " + t);
@@ -1239,7 +1613,7 @@ public final class AgentImpl {
                     String rawName = name != null ? name : "";
                     String display = extractDisplayName(npi, rawName);
                     String teamKey = extractTeamKey(npi);
-                    raws.add(new RawRow(npi, uuid, rawName, display, teamKey, null, null, RowStatus.NPC, -1));
+                    raws.add(new RawRow(npi, uuid, rawName, display, teamKey, null, null, null, RowStatus.NPC, -1));
                     continue;
                 }
 
@@ -1250,6 +1624,19 @@ public final class AgentImpl {
             }
 
             raws.sort(ROW_ORDER);
+
+            // AX-debugtab splice: append the debug row AFTER sorting so it
+            // always sits at the bottom of the list (but still above NPCs,
+            // which were never in `raws` to begin with — their absence is fine
+            // since the debug row is a diagnostic, not a player-count test).
+            DebugTabEntry debug = debugTabEntry;
+            if (debug != null) {
+                if (System.nanoTime() >= debug.expiresAtNanos) {
+                    debugTabEntry = null;
+                } else {
+                    raws.add(debug.toRawRow());
+                }
+            }
 
             List<Object[]> rowEntries = new ArrayList<Object[]>(raws.size());
             for (RawRow r : raws) {
@@ -1332,14 +1719,18 @@ public final class AgentImpl {
         final BedwarsStats stats;   // null unless REAL
         /** M15 — Seraph merged response. {@code null} if Seraph disabled, fetch in-flight, or failed. */
         final SeraphData seraphData;
+        /** M17 — Urchin response. {@code null} if Urchin disabled, fetch in-flight, or failed. */
+        final UrchinData urchinData;
         final RowStatus status;
         final int health;           // 0-20 from scoreboard; -1 if untracked
         RawRow(Object npi, UUID uuid, String rawName, String displayName, String teamKey,
-               BedwarsStats stats, SeraphData seraphData, RowStatus status, int health) {
+               BedwarsStats stats, SeraphData seraphData, UrchinData urchinData,
+               RowStatus status, int health) {
             this.npi = npi;
             this.uuid = uuid; this.rawName = rawName; this.displayName = displayName;
             this.teamKey = teamKey; this.stats = stats;
             this.seraphData = seraphData;
+            this.urchinData = urchinData;
             this.status = status;
             this.health = health;
         }
@@ -1350,22 +1741,27 @@ public final class AgentImpl {
         String display = extractDisplayName(npi, rawName);
         String teamKey = extractTeamKey(npi);
 
-        // Seraph peek-and-maybe-fetch runs alongside Hypixel on every row so
-        // the two pipelines stay in sync — same fetch-armed gate, same in-flight
-        // dedup. A completed SeraphData can populate the tag/client cells even
-        // on NICK / PLACEHOLDER rows (a nicked cheater still gets called out).
-        SeraphData seraphData = peekOrFetchSeraph(uuid, rawName, fetchArmed, cfg);
+        // Seraph + Urchin peek-and-maybe-fetch both run alongside Hypixel on
+        // every row so the three pipelines stay in sync — same fetch-armed
+        // gate, same in-flight dedup. Completed blacklist data populates the
+        // tag / urchin cells even on NICK / PLACEHOLDER rows (a nicked cheater
+        // still gets called out). Alerts are fired once after both blacklist
+        // sources resolve so the double-flag path can dedupe against both
+        // individual sources.
+        SeraphData seraphData = peekOrFetchSeraph(uuid, fetchArmed);
+        UrchinData urchinData = peekOrFetchUrchin(uuid, rawName, fetchArmed);
+        fireBlacklistAlerts(uuid, rawName, seraphData, urchinData, cfg);
 
         CompletableFuture<BedwarsStats> fut = statsCache.peekFuture(uuid);
         if (fut == null) {
             if (fetchArmed) {
                 statsCache.get(uuid);   // kick off async fetch
-                return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, RowStatus.PLACEHOLDER, health);
+                return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, urchinData, RowStatus.PLACEHOLDER, health);
             }
-            return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, RowStatus.UNKNOWN, health);
+            return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, urchinData, RowStatus.UNKNOWN, health);
         }
-        if (!fut.isDone()) return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, RowStatus.PLACEHOLDER, health);
-        if (fut.isCompletedExceptionally()) return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, RowStatus.UNKNOWN, health);
+        if (!fut.isDone()) return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, urchinData, RowStatus.PLACEHOLDER, health);
+        if (fut.isCompletedExceptionally()) return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, urchinData, RowStatus.UNKNOWN, health);
 
         BedwarsStats stats = fut.getNow(null);
         if (stats == null) {
@@ -1374,7 +1770,7 @@ public final class AgentImpl {
             // row but skip the chat line. Alert dedup is shared with the
             // decorateInternal path via alertedNicks so we never double-fire.
             if (!cfg.nickDetection) {
-                return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, RowStatus.UNKNOWN, health);
+                return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, urchinData, RowStatus.UNKNOWN, health);
             }
             if (alertedNicks.add(uuid)) {
                 Agent.log("nick detected (table): name='" + rawName + "' uuid=" + uuid);
@@ -1383,9 +1779,9 @@ public final class AgentImpl {
                             capturedMcLoader);
                 }
             }
-            return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, RowStatus.NICK, health);
+            return new RawRow(npi, uuid, rawName, display, teamKey, null, seraphData, urchinData, RowStatus.NICK, health);
         }
-        return new RawRow(npi, uuid, rawName, display, teamKey, stats, seraphData, RowStatus.REAL, health);
+        return new RawRow(npi, uuid, rawName, display, teamKey, stats, seraphData, urchinData, RowStatus.REAL, health);
     }
 
     /**
@@ -1393,13 +1789,11 @@ public final class AgentImpl {
      * blocking. Fires a fetch when armed + nothing cached; returns {@code null}
      * while a fetch is in flight or if Seraph is disabled / auth-failed.
      *
-     * <p>Also fires the one-shot cheater / bot chat alerts the first time a
-     * completed {@link SeraphData} with those flags walks past. Dedup is
-     * UUID-scoped via {@link #alertedCheaters} / {@link #alertedBots}; both
-     * sets reset on {@code AX-off} via {@link #clearNickAlerts}.
+     * <p>Alerts are NOT fired here — see {@link #fireBlacklistAlerts}, which
+     * runs after both Seraph and Urchin have been peeked so the double-flag
+     * path can dedupe against both individual sources.
      */
-    private static SeraphData peekOrFetchSeraph(UUID uuid, String rawName,
-                                                 boolean fetchArmed, Config cfg) {
+    private static SeraphData peekOrFetchSeraph(UUID uuid, boolean fetchArmed) {
         SeraphCache sc = seraphCache;
         if (sc == null) return null;
         if (sc.authFailed()) {
@@ -1412,25 +1806,91 @@ public final class AgentImpl {
             return null;
         }
         if (!fut.isDone() || fut.isCompletedExceptionally()) return null;
-        SeraphData data = fut.getNow(null);
-        if (data == null) return null;
-        fireSeraphAlerts(uuid, rawName, data, cfg);
-        return data;
+        return fut.getNow(null);
     }
 
-    private static void fireSeraphAlerts(UUID uuid, String rawName, SeraphData data, Config cfg) {
+    /**
+     * Resolve Urchin data for {@code uuid} on the render thread without
+     * blocking. Parallel to {@link #peekOrFetchSeraph}. {@code rawName} is
+     * forwarded to {@link UrchinCache#get(UUID, String)} as the required
+     * {@code name} query param on the first fetch.
+     */
+    private static UrchinData peekOrFetchUrchin(UUID uuid, String rawName, boolean fetchArmed) {
+        UrchinCache uc = urchinCache;
+        if (uc == null) return null;
+        if (uc.authFailed()) {
+            maybeFireUrchinAuthWarning();
+            return null;
+        }
+        CompletableFuture<UrchinData> fut = uc.peekFuture(uuid);
+        if (fut == null) {
+            if (fetchArmed) uc.get(uuid, rawName);
+            return null;
+        }
+        if (!fut.isDone() || fut.isCompletedExceptionally()) return null;
+        return fut.getNow(null);
+    }
+
+    /**
+     * Unified blacklist alert dispatcher. Called once per row per frame from
+     * {@link #buildRawRow} with whatever data each source has resolved so far.
+     *
+     * <p><b>Cheater path — three-set dedup:</b> when both {@code seraphData}
+     * and {@code urchinData} flag the same UUID as a cheater AND neither
+     * single-source alert has fired yet, fire the promoted "FLAGGED by Seraph
+     * + Urchin" line and poison all three sets so no follow-up fires.
+     * Otherwise each source fires independently the first frame its data
+     * arrives. Prevents the alert from flapping when sources arrive in
+     * different frames while still promoting the double-flag when both land
+     * in the same fetch window.
+     *
+     * <p><b>Bot path:</b> per-source, independent. A bot flagged by both
+     * sources produces two chat lines — acceptable noise because bots are
+     * rare and the distinction (which source caught it) is informative.
+     */
+    private static void fireBlacklistAlerts(UUID uuid, String rawName,
+                                            SeraphData sd, UrchinData ud, Config cfg) {
         if (!cfg.chatAlerts) return;
         String name = (rawName != null && !rawName.isEmpty()) ? rawName : shortUuidName(uuid);
-        if (data.hasCheaterTag && alertedCheaters.add(uuid)) {
-            String reason = firstTagText(data);
+
+        boolean seraphCheater = sd != null && sd.hasCheaterTag;
+        boolean urchinCheater = ud != null && ud.hasCheaterTag;
+        boolean alreadyAnySource = alertedDoubleFlags.contains(uuid)
+                || alertedCheaters.contains(uuid)
+                || alertedUrchinCheaters.contains(uuid);
+
+        if (!alreadyAnySource && seraphCheater && urchinCheater) {
+            alertedDoubleFlags.add(uuid);
+            alertedCheaters.add(uuid);
+            alertedUrchinCheaters.add(uuid);
+            String seraphReason = firstTagText(sd);
+            String urchinReason = firstUrchinTagText(ud);
+            Agent.log("blacklist: DOUBLE FLAG name='" + name + "' uuid=" + uuid
+                    + " seraph='" + seraphReason + "' urchin='" + urchinReason + "'");
+            Agent.sendClientChat(Agent.PREFIX + "§4§l" + name + " FLAGGED by Seraph + Urchin"
+                    + RESET + "§c: " + seraphReason + " / " + urchinReason + RESET,
+                    capturedMcLoader);
+        } else if (seraphCheater && alertedCheaters.add(uuid)) {
+            String reason = firstTagText(sd);
             Agent.log("seraph: CHEATER tagged name='" + name + "' uuid=" + uuid + " reason='" + reason + "'");
             Agent.sendClientChat(Agent.PREFIX + "§4-> " + name
                     + " is tagged: " + reason + RESET, capturedMcLoader);
+        } else if (urchinCheater && alertedUrchinCheaters.add(uuid)) {
+            String reason = firstUrchinTagText(ud);
+            Agent.log("urchin: CHEATER tagged name='" + name + "' uuid=" + uuid + " reason='" + reason + "'");
+            Agent.sendClientChat(Agent.PREFIX + "§4-> " + name
+                    + " is tagged by Urchin: " + reason + RESET, capturedMcLoader);
         }
-        if (data.hasBotTag && alertedBots.add(uuid)) {
+
+        if (sd != null && sd.hasBotTag && alertedBots.add(uuid)) {
             Agent.log("seraph: BOT tagged name='" + name + "' uuid=" + uuid);
             Agent.sendClientChat(Agent.PREFIX + "§e-> " + name
                     + " is a bot" + RESET, capturedMcLoader);
+        }
+        if (ud != null && ud.hasBotTag && alertedUrchinBots.add(uuid)) {
+            Agent.log("urchin: BOT tagged name='" + name + "' uuid=" + uuid);
+            Agent.sendClientChat(Agent.PREFIX + "§e-> " + name
+                    + " is a bot (Urchin)" + RESET, capturedMcLoader);
         }
     }
 
@@ -1447,6 +1907,18 @@ public final class AgentImpl {
     }
 
     /**
+     * First non-empty text fragment from an Urchin tag — icon if present,
+     * else tooltip, else a generic "flagged". Urchin tags don't carry a
+     * {@code text} field like Seraph, so the icon glyph doubles as the short
+     * label when available.
+     */
+    private static String firstUrchinTagText(UrchinData data) {
+        List<UrchinData.UrchinTag> shown = displayableUrchinTags(data);
+        if (shown.isEmpty()) return "flagged";
+        return shown.get(0).displayLabel;
+    }
+
+    /**
      * Emit the red "Seraph API key rejected" warning exactly once per session,
      * the first frame after {@link SeraphCache#authFailed()} flips true.
      */
@@ -1455,6 +1927,18 @@ public final class AgentImpl {
         seraphAuthWarningFired = true;
         Agent.log("seraph: API key rejected (401/403) — suppressing further lookups until AX-seraph <newkey>");
         Agent.sendClientChat(Agent.PREFIX + "§cSeraph API key rejected — run AX-seraph <key> to update" + RESET,
+                capturedMcLoader);
+    }
+
+    /**
+     * Emit the red "Urchin API key rejected" warning exactly once per session.
+     * Parallel to {@link #maybeFireSeraphAuthWarning}.
+     */
+    private static void maybeFireUrchinAuthWarning() {
+        if (urchinAuthWarningFired) return;
+        urchinAuthWarningFired = true;
+        Agent.log("urchin: API key rejected (401/403) — suppressing further lookups until AX-urchin <newkey>");
+        Agent.sendClientChat(Agent.PREFIX + "§cUrchin API key rejected — run AX-urchin <key> to update" + RESET,
                 capturedMcLoader);
     }
 
@@ -1541,7 +2025,12 @@ public final class AgentImpl {
         // M15 — tag cell is independent of Hypixel row status. A nicked player
         // can still carry a cheater tag. Empty cell when Seraph is disabled,
         // fetch in-flight, or no flags present.
-        if (col.equals(Config.COL_TAG)) return formatTag(r);
+        if (col.equals(Config.COL_TAG)) return formatTag(r, cfg);
+
+        // M17 — urchin cell parallels the tag cell, with Urchin data in place
+        // of Seraph. Same branch logic: independent of Hypixel status so
+        // blacklist entries survive a nicked row.
+        if (col.equals(Config.COL_URCHIN)) return formatUrchin(r, cfg);
 
         switch (r.status) {
             case REAL: {
@@ -1624,7 +2113,7 @@ public final class AgentImpl {
      * Hypixel loading state; REAL/NICK/UNKNOWN rows with no Seraph data show
      * blank — either Seraph is disabled or the player is unflagged.
      */
-    private static String formatTag(RawRow r) {
+    private static String formatTag(RawRow r, Config cfg) {
         if (r.status == RowStatus.NPC) return "";
         SeraphData d = r.seraphData;
         if (d == null) {
@@ -1632,7 +2121,79 @@ public final class AgentImpl {
         }
         if (d.tags == null || d.tags.isEmpty()) return "";
         SeraphData.SeraphTag t = d.tags.get(0);
-        return t.sectionColorCode + "[" + t.text + "]" + RESET;
+        String category = d.hasCheaterTag ? "cheater" : (d.hasBotTag ? "bot" : "default");
+        String code = resolveTagColor(cfg, Config.COL_TAG, category, t.sectionColorCode);
+        return code + "[" + t.text + "]" + RESET;
+    }
+
+    /**
+     * Urchin tag cell — first-wins from {@link UrchinData#tags}. Colors come
+     * straight from Urchin's Cubelify response, RGB-mapped to §-codes at parse
+     * time. Urchin tags don't carry a {@code text} field, so the {@code icon}
+     * glyph is used as the label; when icon is missing we fall back to the
+     * tag's tooltip (truncated). NPC rows render blank; a PLACEHOLDER row with
+     * no Urchin data yet shows {@code [...]}; REAL/NICK/UNKNOWN with no data
+     * show blank (Urchin disabled or unflagged).
+     */
+    private static String formatUrchin(RawRow r, Config cfg) {
+        if (r.status == RowStatus.NPC) return "";
+        UrchinData d = r.urchinData;
+        if (d == null) {
+            return r.status == RowStatus.PLACEHOLDER ? CELL_PLACEHOLDER : "";
+        }
+        List<UrchinData.UrchinTag> shown = displayableUrchinTags(d);
+        if (shown.isEmpty()) return "";
+        UrchinData.UrchinTag t = shown.get(0);
+        return urchinTabBadge(t, cfg) + RESET;
+    }
+
+    /**
+     * Compact badge for the Urchin tab column. The four cheater subtypes get
+     * fixed short codes with custom colors so they're instantly distinguishable
+     * at a glance (Sniper/Blatant/Closet/Confirmed — the canonical Urchin
+     * public-access categories). Any other tag (Bot / KD / ping-ms / unknown
+     * fallback) keeps the Urchin-supplied color and full short label.
+     *
+     * <p>MC 1.8 has no true orange — {@code §6} (gold) is the closest. Purple
+     * is {@code §5} (dark purple) rather than {@code §d} (light purple /
+     * magenta) since "Confirmed" deserves a richer tone than the pink.
+     */
+    private static String urchinTabBadge(UrchinData.UrchinTag t, Config cfg) {
+        String label = t.displayLabel;
+        String shortCode;
+        String category;
+        if ("Sniper".equals(label))         { shortCode = "[S]";  category = "sniper"; }
+        else if ("Blatant".equals(label))   { shortCode = "[BC]"; category = "blatant"; }
+        else if ("Closet".equals(label))    { shortCode = "[CC]"; category = "closet"; }
+        else if ("Confirmed".equals(label)) { shortCode = "[C]";  category = "confirmed"; }
+        else if ("Bot".equals(label))       { shortCode = "[" + label + "]"; category = "bot"; }
+        else                                { shortCode = "[" + label + "]"; category = "default"; }
+        String code = resolveTagColor(cfg, Config.COL_URCHIN, category, t.sectionColorCode);
+        return code + shortCode;
+    }
+
+    /**
+     * Resolve the §-code for one tag-cell category. Walks
+     * {@code cfg.tagColors.get(col).get(category)} → {@code get("default")} →
+     * the supplied {@code vendorFallback} (Seraph/Urchin-shipped color) →
+     * {@code §7}. Lets users override per-category colors in
+     * {@code modes/bedwars.json} while still getting something visible if they
+     * deleted the whole tagColors section.
+     */
+    private static String resolveTagColor(Config cfg, String col, String category, String vendorFallback) {
+        if (cfg != null && cfg.tagColors != null) {
+            Map<String, String> catMap = cfg.tagColors.get(col);
+            if (catMap != null) {
+                String hit = catMap.get(category);
+                if (hit == null) hit = catMap.get("default");
+                if (hit != null) {
+                    String code = ColorTier.resolveColorCode(hit);
+                    if (code != null && !code.isEmpty()) return code;
+                }
+            }
+        }
+        if (vendorFallback != null && !vendorFallback.isEmpty()) return vendorFallback;
+        return "§7";
     }
 
     /** 1234 → "1,234". Locale-agnostic, thousands separator only. */

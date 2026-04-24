@@ -61,7 +61,9 @@ public final class Config {
     public static final String COL_KDR       = "kdr";
     public static final String COL_BBLR      = "bblr";
     /** M15 — Seraph Cubelify blacklist/bot/member tag, first-wins. Empty when Seraph has no flags. */
-    public static final String COL_TAG       = "tag";
+    public static final String COL_TAG       = "seraph";
+    /** M17 — Urchin Cubelify blacklist tag, first-wins. Empty when Urchin has no flags. */
+    public static final String COL_URCHIN    = "urchin";
 
     private static final Set<String> VALID_COLUMNS;
     private static final Set<String> RECOGNIZED_KEYS;
@@ -71,11 +73,11 @@ public final class Config {
         valid.add(COL_WL);     valid.add(COL_WINS);      valid.add(COL_HEALTH);
         valid.add(COL_FINALS); valid.add(COL_BEDS);      valid.add(COL_WINSTREAK);
         valid.add(COL_KDR);    valid.add(COL_BBLR);
-        valid.add(COL_TAG);
+        valid.add(COL_TAG);    valid.add(COL_URCHIN);
         VALID_COLUMNS = Collections.unmodifiableSet(valid);
 
         LinkedHashSet<String> keys = new LinkedHashSet<String>(Arrays.asList(
-                "apiKey", "seraphApiKey", "activeMode", "nickDetection", "chatAlerts", "ignoreList"));
+                "apiKey", "seraphApiKey", "urchinApiKey", "activeMode", "nickDetection", "chatAlerts", "ignoreList"));
         RECOGNIZED_KEYS = Collections.unmodifiableSet(keys);
     }
 
@@ -109,6 +111,13 @@ public final class Config {
      * ({@link #writeSeraphApiKey}).
      */
     public final String seraphApiKey;
+    /**
+     * Urchin API key for the M17 second-opinion blacklist integration. {@code
+     * null} when unset — in that case the Urchin pipeline runs dormant (no
+     * network traffic, empty urchin column). Rotated via the {@code AX-urchin
+     * <key>} chat command ({@link #writeUrchinApiKey}).
+     */
+    public final String urchinApiKey;
     public final String activeMode;
     public final boolean nickDetection;
     public final boolean chatAlerts;
@@ -131,17 +140,20 @@ public final class Config {
     public final List<String> columns;
     public final Map<String, List<ColorTier>> colors;
     public final Map<String, String> headers;
+    /** Passthrough — category→color-name map per tag column (seraph / urchin). See {@link ModeConfig#tagColors}. */
+    public final Map<String, Map<String, String>> tagColors;
     /** Passthrough from {@link #modeConfig} — FKDR threat threshold for the active mode. */
     public final double fkdrThreshold;
     /** Passthrough from {@link #modeConfig} — stars threat threshold for the active mode. */
     public final int starsThreshold;
 
-    private Config(String apiKey, String seraphApiKey, String activeMode,
+    private Config(String apiKey, String seraphApiKey, String urchinApiKey, String activeMode,
                    boolean nickDetection, boolean chatAlerts,
                    Set<String> ignoreList,
                    ModeConfig modeConfig, List<String> issues) {
         this.apiKey = apiKey;
         this.seraphApiKey = seraphApiKey;
+        this.urchinApiKey = urchinApiKey;
         this.activeMode = activeMode;
         this.nickDetection = nickDetection;
         this.chatAlerts = chatAlerts;
@@ -151,6 +163,7 @@ public final class Config {
         this.columns = modeConfig.columns;
         this.colors = modeConfig.colors;
         this.headers = modeConfig.headers;
+        this.tagColors = modeConfig.tagColors;
         this.fkdrThreshold = modeConfig.fkdrThreshold;
         this.starsThreshold = modeConfig.starsThreshold;
     }
@@ -172,10 +185,12 @@ public final class Config {
         boolean chatAlerts = true;
         Set<String> ignoreList = Collections.emptySet();
         String seraphApiKey = null;
+        String urchinApiKey = null;
 
         if (root != null) {
             if (apiKey == null) apiKey = readString(root, "apiKey", issues);
             seraphApiKey = readString(root, "seraphApiKey", issues);
+            urchinApiKey = readString(root, "urchinApiKey", issues);
             String modeStr = readString(root, "activeMode", issues);
             if (modeStr != null) {
                 String norm = modeStr.toLowerCase();
@@ -212,7 +227,7 @@ public final class Config {
 
         ModeConfig modeConfig = ModeConfig.load(activeMode, issues);
 
-        return new Config(apiKey, seraphApiKey, activeMode, nickDetection, chatAlerts,
+        return new Config(apiKey, seraphApiKey, urchinApiKey, activeMode, nickDetection, chatAlerts,
                 ignoreList, modeConfig, Collections.unmodifiableList(issues));
     }
 
@@ -309,6 +324,37 @@ public final class Config {
         }
     }
 
+    /**
+     * Update {@code urchinApiKey} in {@code config.json} without clobbering
+     * other fields. Called from the {@code AX-urchin <key>} chat command (M17).
+     * Accepts empty string to clear.
+     *
+     * <p>Returns {@code true} on success; {@code false} on any I/O or parse
+     * failure (caller surfaces the error in chat).
+     */
+    public static boolean writeUrchinApiKey(String key) {
+        String normalized = key == null ? "" : key.trim();
+        Path path = resolveConfigPath();
+        if (path == null) return false;
+        try {
+            if (path.getParent() != null) Files.createDirectories(path.getParent());
+            JsonObject root = null;
+            if (Files.exists(path)) {
+                try (Reader r = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+                    JsonElement el = JsonParser.parseReader(r);
+                    if (el != null && el.isJsonObject()) root = el.getAsJsonObject();
+                }
+            }
+            if (root == null) root = buildDefaultGlobalJson();
+            root.addProperty("urchinApiKey", normalized);
+            String pretty = new GsonBuilder().setPrettyPrinting().create().toJson(root);
+            Files.write(path, pretty.getBytes(StandardCharsets.UTF_8));
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     // --- helpers ---------------------------------------------------------
 
     private static JsonObject readOrCreateGlobal(List<String> issues) {
@@ -347,6 +393,7 @@ public final class Config {
         JsonObject o = new JsonObject();
         o.addProperty("apiKey", "");
         o.addProperty("seraphApiKey", "");
+        o.addProperty("urchinApiKey", "");
         o.addProperty("activeMode", DEFAULT_MODE);
         o.addProperty("nickDetection", true);
         o.addProperty("chatAlerts", true);

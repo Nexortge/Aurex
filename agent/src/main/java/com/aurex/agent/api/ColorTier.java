@@ -28,6 +28,24 @@ public final class ColorTier {
     /** MC color name → §-code. Includes common aliases (grey/gray, pink/light_purple). */
     private static final Map<String, String> NAMED_COLORS = buildNamedColors();
 
+    /**
+     * Resolve a user-supplied color name ({@code "red"}, {@code "dark_purple"},
+     * {@code "rainbow"}, or a raw {@code §c} code) into the §-code it renders
+     * as. Returns {@code null} for unknown names. Used by the tag-column
+     * category-color resolver outside the tier-ladder flow.
+     *
+     * <p>{@code "rainbow"} returns an empty string — callers that support
+     * rainbow must check for the sentinel separately.
+     */
+    public static String resolveColorCode(String raw) {
+        if (raw == null) return null;
+        String trimmed = raw.trim();
+        if (trimmed.isEmpty()) return null;
+        if (trimmed.equalsIgnoreCase("rainbow")) return "";
+        if (trimmed.length() == 2 && trimmed.charAt(0) == '§') return trimmed;
+        return NAMED_COLORS.get(trimmed.toLowerCase().replace('-', '_'));
+    }
+
     public final double min;
     /** As user wrote it — preserved so we can round-trip back to disk. */
     public final String rawColor;

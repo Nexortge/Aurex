@@ -80,7 +80,13 @@ public final class ModeConfig {
     // Each inner array is {min (Number), color (String)}. Min must be numeric;
     // color is a name from ColorTier.NAMED_COLORS or the literal "rainbow".
 
-    private static final Object[][] BW_COLUMNS = {{"stars"}, {"name"}, {"fkdr"}, {"wl"}, {"wins"}};
+    private static final Object[][] BW_COLUMNS = {
+            {"stars"}, {"name"}, {"fkdr"}, {"wl"}, {"wins"},
+            // Seraph + Urchin tag columns on by default. Colors/header text stay
+            // editable via the mode file; users who don't want the columns can
+            // drop them from `columns` by hand (same as any other stat column).
+            {"tag"}, {"urchin"}
+    };
 
     /** Standard Bedwars prestige palette per 100 stars, rainbow at 1000+. */
     private static final Object[][] BW_STARS = {
@@ -191,8 +197,34 @@ public final class ModeConfig {
      * the self-documenting default {@code modes/bedwars.json} lists
      * {@code colors.tag} alongside the other columns (M11 discovery pattern).
      */
-    private static final Object[][] BW_TAG = {
-            {0, "white"},
+    /**
+     * Category→color map for the {@code seraph} column. Keys match
+     * {@link SeraphData} classification outputs ({@code cheater}, {@code bot})
+     * plus a {@code default} fallback used for any other tag. Values are
+     * {@link ColorTier#NAMED_COLORS} entries; resolved at render time in
+     * {@code AgentImpl.formatTag}.
+     */
+    private static final String[][] BW_SERAPH_COLORS = {
+            {"cheater", "red"},
+            {"bot",     "red"},
+            {"default", "white"},
+    };
+
+    /**
+     * Category→color map for the {@code urchin} column. Keys match the
+     * {@code displayLabel} outputs in {@code UrchinData.UrchinTag}
+     * ({@code Sniper} / {@code Blatant} / {@code Closet} / {@code Confirmed} /
+     * {@code Bot}) — lowercased here so config lookups stay case-insensitive.
+     * {@code default} is the fallback used for unmapped labels (KD, ping
+     * values, unrecognized icons).
+     */
+    private static final String[][] BW_URCHIN_COLORS = {
+            {"sniper",    "red"},
+            {"blatant",   "gold"},
+            {"closet",    "yellow"},
+            {"confirmed", "dark_purple"},
+            {"bot",       "red"},
+            {"default",   "white"},
     };
 
     /** All supported Bedwars-mode columns. Keys must match {@link Config} COL_* constants. */
@@ -211,8 +243,20 @@ public final class ModeConfig {
         m.put(Config.COL_WINSTREAK, BW_WINSTREAK);
         m.put(Config.COL_KDR,       BW_KDR);
         m.put(Config.COL_BBLR,      BW_BBLR);
-        m.put(Config.COL_TAG,       BW_TAG);
         BW_COLOR_DEFAULTS = Collections.unmodifiableMap(m);
+    }
+
+    /**
+     * Category-keyed default color maps for tag columns ({@code seraph} +
+     * {@code urchin}). Separate from {@link #BW_COLOR_DEFAULTS} because the
+     * shape is {@code {category → colorName}}, not a numeric tier ladder.
+     */
+    private static final Map<String, String[][]> BW_TAG_COLOR_DEFAULTS;
+    static {
+        LinkedHashMap<String, String[][]> m = new LinkedHashMap<String, String[][]>();
+        m.put(Config.COL_TAG,    BW_SERAPH_COLORS);
+        m.put(Config.COL_URCHIN, BW_URCHIN_COLORS);
+        BW_TAG_COLOR_DEFAULTS = Collections.unmodifiableMap(m);
     }
 
     /** Default column header labels. Keys must match {@link Config} COL_* constants. */
@@ -232,7 +276,8 @@ public final class ModeConfig {
         m.put(Config.COL_WINSTREAK, "WS");
         m.put(Config.COL_KDR,       "KDR");
         m.put(Config.COL_BBLR,      "BBLR");
-        m.put(Config.COL_TAG,       "Tag");
+        m.put(Config.COL_TAG,       "Seraph");
+        m.put(Config.COL_URCHIN,    "Urchin");
         BW_HEADER_DEFAULTS = Collections.unmodifiableMap(m);
     }
 
@@ -244,6 +289,18 @@ public final class ModeConfig {
     public final Map<String, List<ColorTier>> colors;
     /** Column id → display label used for tab headers. Backfilled with built-in defaults. */
     public final Map<String, String> headers;
+    /**
+     * Category→color-name map per tag column ({@code seraph}, {@code urchin}).
+     * Separate from {@link #colors} because the shape is flat
+     * {@code {category → colorName}}, not a numeric tier ladder.
+     *
+     * <p>Both the outer key (column id) and inner keys (category) are
+     * lowercased at parse time so config edits stay case-insensitive. Values
+     * are raw color names from {@link ColorTier#NAMED_COLORS} or
+     * {@code "rainbow"}. Resolution fallback:
+     * {@code tagColors[col][category] → tagColors[col]["default"] → built-in default}.
+     */
+    public final Map<String, Map<String, String>> tagColors;
     /** Minimum FKDR to flag an opponent as a threat in the game-start report. */
     public final double fkdrThreshold;
     /** Minimum stars to flag an opponent as a threat in the game-start report. */
@@ -252,11 +309,13 @@ public final class ModeConfig {
     private ModeConfig(String mode, List<String> columns,
                        Map<String, List<ColorTier>> colors,
                        Map<String, String> headers,
+                       Map<String, Map<String, String>> tagColors,
                        double fkdrThreshold, int starsThreshold) {
         this.mode = mode;
         this.columns = columns;
         this.colors = colors;
         this.headers = headers;
+        this.tagColors = tagColors;
         this.fkdrThreshold = fkdrThreshold;
         this.starsThreshold = starsThreshold;
     }
@@ -404,7 +463,82 @@ public final class ModeConfig {
             alerts.addProperty("starsThreshold", BW_DEFAULT_STARS_THRESHOLD);
             patched = true;
         }
+
+        // One-time migration: column id "tag" → "seraph" (matches the COL_TAG
+        // value rename when we made the Seraph column's colors editable). Walk
+        // the columns array, headers map, and legacy colors.tag ladder.
+        if (renameColumnTagToSeraph(root)) patched = true;
+
+        // tagColors block — category→color maps for the seraph + urchin
+        // columns. Added late in M17, so pre-existing mode files won't have it.
+        JsonObject tagColors;
+        if (root.has("tagColors") && root.get("tagColors").isJsonObject()) {
+            tagColors = root.getAsJsonObject("tagColors");
+        } else {
+            tagColors = new JsonObject();
+            root.add("tagColors", tagColors);
+            patched = true;
+        }
+        for (Map.Entry<String, String[][]> e : BW_TAG_COLOR_DEFAULTS.entrySet()) {
+            JsonObject catMap;
+            if (tagColors.has(e.getKey()) && tagColors.get(e.getKey()).isJsonObject()) {
+                catMap = tagColors.getAsJsonObject(e.getKey());
+            } else {
+                catMap = new JsonObject();
+                tagColors.add(e.getKey(), catMap);
+                patched = true;
+            }
+            for (String[] kv : e.getValue()) {
+                if (!catMap.has(kv[0])) {
+                    catMap.addProperty(kv[0], kv[1]);
+                    patched = true;
+                }
+            }
+        }
         return patched;
+    }
+
+    /**
+     * Rewrite any legacy {@code "tag"} column id to {@code "seraph"}. Touches
+     * {@code columns[]}, {@code headers.tag}, and drops the now-unused
+     * {@code colors.tag} / {@code colors.seraph} / {@code colors.urchin}
+     * tier-ladder entries (those columns now pull color from {@code tagColors}).
+     * Returns true if anything was changed so the caller writes the file back.
+     */
+    private static boolean renameColumnTagToSeraph(JsonObject root) {
+        boolean changed = false;
+        if (root.has("columns") && root.get("columns").isJsonArray()) {
+            JsonArray cols = root.getAsJsonArray("columns");
+            for (int i = 0; i < cols.size(); i++) {
+                JsonElement el = cols.get(i);
+                if (el.isJsonPrimitive() && el.getAsJsonPrimitive().isString()
+                        && "tag".equals(el.getAsString())) {
+                    cols.set(i, new com.google.gson.JsonPrimitive("seraph"));
+                    changed = true;
+                }
+            }
+        }
+        if (root.has("headers") && root.get("headers").isJsonObject()) {
+            JsonObject headers = root.getAsJsonObject("headers");
+            if (headers.has("tag") && !headers.has("seraph")) {
+                headers.add("seraph", headers.get("tag"));
+                headers.remove("tag");
+                changed = true;
+            } else if (headers.has("tag")) {
+                headers.remove("tag");
+                changed = true;
+            }
+        }
+        if (root.has("colors") && root.get("colors").isJsonObject()) {
+            JsonObject colors = root.getAsJsonObject("colors");
+            for (String legacy : new String[] { "tag", "seraph", "urchin" }) {
+                if (colors.has(legacy)) {
+                    colors.remove(legacy);
+                    changed = true;
+                }
+            }
+        }
+        return changed;
     }
 
     /** Build a JSON array of {min, color} tier objects from a default palette table. */
@@ -433,15 +567,18 @@ public final class ModeConfig {
                 colors.put(e.getKey(), buildTiers(e.getKey(), e.getValue(), sink));
             }
             Map<String, String> headers = new LinkedHashMap<String, String>(BW_HEADER_DEFAULTS);
+            Map<String, Map<String, String>> tagColors = buildDefaultTagColors();
             return new ModeConfig(mode,
                     Collections.unmodifiableList(cols),
                     Collections.unmodifiableMap(colors),
                     Collections.unmodifiableMap(headers),
+                    Collections.unmodifiableMap(tagColors),
                     BW_DEFAULT_FKDR_THRESHOLD, BW_DEFAULT_STARS_THRESHOLD);
         }
         return new ModeConfig(mode, Collections.<String>emptyList(),
                 Collections.<String, List<ColorTier>>emptyMap(),
                 Collections.<String, String>emptyMap(),
+                Collections.<String, Map<String, String>>emptyMap(),
                 BW_DEFAULT_FKDR_THRESHOLD, BW_DEFAULT_STARS_THRESHOLD);
     }
 
@@ -465,6 +602,14 @@ public final class ModeConfig {
             }
             root.add("colors", colors);
 
+            JsonObject tagColors = new JsonObject();
+            for (Map.Entry<String, String[][]> e : BW_TAG_COLOR_DEFAULTS.entrySet()) {
+                JsonObject catMap = new JsonObject();
+                for (String[] kv : e.getValue()) catMap.addProperty(kv[0], kv[1]);
+                tagColors.add(e.getKey(), catMap);
+            }
+            root.add("tagColors", tagColors);
+
             JsonObject alerts = new JsonObject();
             alerts.addProperty("fkdrThreshold", BW_DEFAULT_FKDR_THRESHOLD);
             alerts.addProperty("starsThreshold", BW_DEFAULT_STARS_THRESHOLD);
@@ -487,6 +632,7 @@ public final class ModeConfig {
         List<String> cols = parseColumns(mode, root, issues);
         Map<String, List<ColorTier>> colors = parseColors(mode, root, issues);
         Map<String, String> headers = parseHeaders(mode, root, issues);
+        Map<String, Map<String, String>> tagColors = parseTagColors(mode, root, issues);
         double[] alerts = parseAlerts(mode, root, issues);
 
         // Backfill any missing column tiers / headers with defaults — keeps old
@@ -503,12 +649,88 @@ public final class ModeConfig {
                     headers.put(e.getKey(), e.getValue());
                 }
             }
+            // Backfill per-column tag color maps. If the user already has a
+            // (partial) map we keep their entries and only fill in missing
+            // defaults — lets them override e.g. "sniper" without losing the
+            // built-in "default" fallback.
+            for (Map.Entry<String, String[][]> e : BW_TAG_COLOR_DEFAULTS.entrySet()) {
+                Map<String, String> existing = tagColors.get(e.getKey());
+                if (existing == null) {
+                    tagColors.put(e.getKey(), defaultTagColorMap(e.getValue()));
+                } else {
+                    for (String[] kv : e.getValue()) {
+                        if (!existing.containsKey(kv[0])) existing.put(kv[0], kv[1]);
+                    }
+                }
+            }
+        }
+        Map<String, Map<String, String>> frozenTagColors = new LinkedHashMap<String, Map<String, String>>();
+        for (Map.Entry<String, Map<String, String>> e : tagColors.entrySet()) {
+            frozenTagColors.put(e.getKey(), Collections.unmodifiableMap(e.getValue()));
         }
         return new ModeConfig(mode,
                 Collections.unmodifiableList(cols),
                 Collections.unmodifiableMap(colors),
                 Collections.unmodifiableMap(headers),
+                Collections.unmodifiableMap(frozenTagColors),
                 alerts[0], (int) alerts[1]);
+    }
+
+    /**
+     * Parse the top-level {@code tagColors} section — a nested map of
+     * {@code {columnId → {category → colorName}}}. Entries with invalid color
+     * names are dropped with an issue note (the built-in default will be
+     * backfilled). Returns a mutable map so callers can mutate/backfill before
+     * freezing.
+     */
+    private static Map<String, Map<String, String>> parseTagColors(String mode, JsonObject root, List<String> issues) {
+        Map<String, Map<String, String>> out = new LinkedHashMap<String, Map<String, String>>();
+        if (!root.has("tagColors") || !root.get("tagColors").isJsonObject()) {
+            return out;
+        }
+        JsonObject tc = root.getAsJsonObject("tagColors");
+        for (Map.Entry<String, JsonElement> colEntry : tc.entrySet()) {
+            String col = colEntry.getKey().toLowerCase();
+            JsonElement el = colEntry.getValue();
+            if (el == null || !el.isJsonObject()) {
+                issues.add("mode " + mode + ": tagColors." + col + " must be an object — skipped");
+                continue;
+            }
+            Map<String, String> catMap = new LinkedHashMap<String, String>();
+            for (Map.Entry<String, JsonElement> catEntry : el.getAsJsonObject().entrySet()) {
+                String cat = catEntry.getKey().toLowerCase();
+                JsonElement v = catEntry.getValue();
+                if (v == null || !v.isJsonPrimitive() || !v.getAsJsonPrimitive().isString()) {
+                    issues.add("mode " + mode + ": tagColors." + col + "." + cat + " must be a string — skipped");
+                    continue;
+                }
+                String color = v.getAsString();
+                if (ColorTier.resolveColorCode(color) == null) {
+                    issues.add("mode " + mode + ": tagColors." + col + "." + cat
+                            + " unknown color \"" + color + "\" — skipped");
+                    continue;
+                }
+                catMap.put(cat, color);
+            }
+            out.put(col, catMap);
+        }
+        return out;
+    }
+
+    /** Materialize one category→color map from the {@link #BW_TAG_COLOR_DEFAULTS} 2D-array shape. */
+    private static Map<String, String> defaultTagColorMap(String[][] defaults) {
+        LinkedHashMap<String, String> m = new LinkedHashMap<String, String>();
+        for (String[] kv : defaults) m.put(kv[0], kv[1]);
+        return m;
+    }
+
+    /** Build the full {@code tagColors} tree for a fresh Bedwars config. */
+    private static Map<String, Map<String, String>> buildDefaultTagColors() {
+        LinkedHashMap<String, Map<String, String>> m = new LinkedHashMap<String, Map<String, String>>();
+        for (Map.Entry<String, String[][]> e : BW_TAG_COLOR_DEFAULTS.entrySet()) {
+            m.put(e.getKey(), defaultTagColorMap(e.getValue()));
+        }
+        return m;
     }
 
     /**

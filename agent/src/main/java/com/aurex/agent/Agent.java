@@ -326,7 +326,8 @@ public final class Agent {
                 sendClientChat(PREFIX + "§edisplay=" + (displayEnabled ? "on" : "off")
                         + " fetch=" + (fetchArmed ? "armed" : "idle")
                         + " hypixel=" + (isHypixelEnabled() ? "on" : "off")
-                        + " seraph=" + (isSeraphEnabled() ? "on" : "off"));
+                        + " seraph=" + (isSeraphEnabled() ? "on" : "off")
+                        + " urchin=" + (isUrchinEnabled() ? "on" : "off"));
                 return true;
             }
             if (trimmed.equalsIgnoreCase("AX-help")) {
@@ -352,11 +353,26 @@ public final class Agent {
                 onAxSeraph(rest);
                 return true;
             }
+            // AX-urchin <key> — rotate the Urchin API key (M17). Parallel to
+            // AX-seraph. Length-9 prefix.
+            if (isAxUrchinCommand(trimmed)) {
+                String rest = trimmed.length() > 9 ? trimmed.substring(9).trim() : "";
+                onAxUrchin(rest);
+                return true;
+            }
             // AX-check <name> — debug command: Mojang username -> UUID, then
             // dump Hypixel + Seraph results to client chat. Length-8 prefix.
             if (isAxCheckCommand(trimmed)) {
                 String rest = trimmed.length() > 8 ? trimmed.substring(8).trim() : "";
                 onAxCheck(rest);
+                return true;
+            }
+            // AX-debugtab <name> — splice a synthetic tab row for 10s using
+            // real Hypixel/Seraph/Urchin data for the named player. Length-11
+            // prefix. Must be tested BEFORE the typo guard.
+            if (isAxDebugTabCommand(trimmed)) {
+                String rest = trimmed.length() > 11 ? trimmed.substring(11).trim() : "";
+                onAxDebugTab(rest);
                 return true;
             }
             // AX-mode [name] — list known modes, or switch active mode and hot-reload.
@@ -531,12 +547,20 @@ public final class Agent {
         return matchesAxPrefix(s, "ax-seraph");
     }
 
+    private static boolean isAxUrchinCommand(String s) {
+        return matchesAxPrefix(s, "ax-urchin");
+    }
+
     private static boolean isAxHypixelCommand(String s) {
         return matchesAxPrefix(s, "ax-hypixel");
     }
 
     private static boolean isAxCheckCommand(String s) {
         return matchesAxPrefix(s, "ax-check");
+    }
+
+    private static boolean isAxDebugTabCommand(String s) {
+        return matchesAxPrefix(s, "ax-debugtab");
     }
 
     /**
@@ -553,7 +577,9 @@ public final class Agent {
         sendClientChat(PREFIX + "  §fAX-ignore <name> §7/ §fAX-removeignore <name> §8— manage threat-report ignore list");
         sendClientChat(PREFIX + "  §fAX-hypixel <key> §8— rotate Hypixel API key (hot-swap, no restart)");
         sendClientChat(PREFIX + "  §fAX-seraph <key> §8— rotate Seraph API key (hot-swap, no restart)");
-        sendClientChat(PREFIX + "  §fAX-check <name> §8— debug: dump Hypixel + Seraph for a player");
+        sendClientChat(PREFIX + "  §fAX-urchin <key> §8— rotate Urchin API key (hot-swap, no restart)");
+        sendClientChat(PREFIX + "  §fAX-check <name> §8— debug: dump Hypixel + Seraph + Urchin for a player");
+        sendClientChat(PREFIX + "  §fAX-debugtab <name> §8— splice a synthetic tab row for 10s (visual check)");
     }
 
     /**
@@ -651,6 +677,51 @@ public final class Agent {
     private static volatile Method implOnAxSeraphMethod;
 
     /**
+     * Bridge for {@code AX-urchin <key>} into {@link AgentImpl}. Parallel to
+     * {@link #onAxSeraph} — validates non-empty, persists via
+     * {@link com.aurex.agent.api.Config#writeUrchinApiKey}, hot-swaps the
+     * {@link com.aurex.agent.api.UrchinCache}. Log-scrubs the key body.
+     */
+    private static void onAxUrchin(String rest) {
+        try {
+            Method m = implOnAxUrchinMethod;
+            if (m == null) {
+                m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                        .getMethod("onAxUrchin", String.class);
+                implOnAxUrchinMethod = m;
+            }
+            m.invoke(null, rest);
+        } catch (Throwable t) {
+            log("onAxUrchin bridge failed: " + t);
+        }
+    }
+
+    private static volatile Method implOnAxUrchinMethod;
+
+    /**
+     * Bridge for {@code AX-debugtab <name>} into {@link AgentImpl}. Mirrors
+     * {@link #onAxCheck} — the impl side does the Mojang resolve + triple
+     * fetch, then stores a time-boxed synthetic row that {@code getTabData}
+     * splices in each frame. We keep the bridge here because AgentImpl lives
+     * on bootstrap and this class lives on MC's loader.
+     */
+    private static void onAxDebugTab(String rest) {
+        try {
+            Method m = implOnAxDebugTabMethod;
+            if (m == null) {
+                m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                        .getMethod("onAxDebugTab", String.class);
+                implOnAxDebugTabMethod = m;
+            }
+            m.invoke(null, rest);
+        } catch (Throwable t) {
+            log("onAxDebugTab bridge failed: " + t);
+        }
+    }
+
+    private static volatile Method implOnAxDebugTabMethod;
+
+    /**
      * Bridge for {@code AX-hypixel <key>} into {@link AgentImpl}. Validates the
      * key argument isn't empty, persists via {@link com.aurex.agent.api.Config#writeApiKey},
      * rebuilds {@link AgentImpl}'s Hypixel pipeline in place, and fires a probe
@@ -696,6 +767,28 @@ public final class Agent {
     }
 
     private static volatile Method implSeraphStatusMethod;
+
+    /**
+     * Read-only query for AX-status — "is Urchin wired up?" Parallel to
+     * {@link #isSeraphEnabled}. Returns false on any reflection error so the
+     * status line stays honest.
+     */
+    private static boolean isUrchinEnabled() {
+        try {
+            Method m = implUrchinStatusMethod;
+            if (m == null) {
+                m = Class.forName("com.aurex.agent.AgentImpl", true, null)
+                        .getMethod("isUrchinEnabled");
+                implUrchinStatusMethod = m;
+            }
+            Object res = m.invoke(null);
+            return res instanceof Boolean && (Boolean) res;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static volatile Method implUrchinStatusMethod;
 
     /**
      * Read-only query for AX-status — "is Hypixel wired up?" Returns true when
